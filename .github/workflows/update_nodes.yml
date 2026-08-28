@@ -1,44 +1,41 @@
-name: Auto Update Sub Nodes
+name: Auto Update V2Ray Nodes
 
 on:
   schedule:
-    - cron: '0 */2 * * *'
-  workflow_dispatch:
+    # 每 6 小时自动运行一次
+    - cron: '0 */6 * * *'
+  workflow_dispatch: # 支持在 GitHub 页面手动点击 Run workflow 触发
 
 jobs:
   update-nodes:
     runs-on: ubuntu-latest
+    
+    # 授予写入权限，确保能够正常提交修改后的 nekoray_sub.txt
+    permissions:
+      contents: write
 
     steps:
       - name: Checkout Repository
-        uses: actions/checkout@v5
-        with:
-          fetch-depth: 0  # 关键修复：禁用浅克隆，拉取完整 Git 提交历史
+        uses: actions/checkout@v4
 
       - name: Set up Python
-        uses: actions/setup-python@v6
+        uses: actions/setup-python@v5
         with:
           python-version: '3.10'
 
-      - name: Run Scraper Script
-        run: |
-          python main.py
+      - name: Run Script to Fetch and Filter Nodes
+        run: python main.py
 
       - name: Commit and Push to GitHub
         run: |
-          git config --local user.name "github-actions[bot]"
           git config --local user.email "github-actions[bot]@users.noreply.github.com"
+          git config --local user.name "github-actions[bot]"
           git add nekoray_sub.txt
-          if git diff --staged --quiet; then
-            echo "节点没有变化，跳过 GitHub 提交"
-          else
-            git commit -m "🤖 Auto Update: 精确剔除假SNI并更新节点订阅"
+          
+          # 仅当文件存在变动时才提交并推送至当前 GitHub 仓库
+          if ! git diff --staged --quiet; then
+            git commit -m "Auto update nodes [$(date -u +'%Y-%m-%d %H:%M UTC')]"
             git push
+          else
+            echo "节点文件未发生变化，跳过 Push。"
           fi
-
-      - name: Sync to Gitee
-        env:
-          GITEE_TOKEN: ${{ secrets.GITEE_TOKEN }}
-        run: |
-          git remote add gitee https://oauth2:${GITEE_TOKEN}@gitee.com/renyong_8051/giehub.git
-          git push -f gitee main:master || git push -f gitee main:main
