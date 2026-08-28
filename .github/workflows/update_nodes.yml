@@ -11,10 +11,10 @@ jobs:
 
     steps:
       - name: Checkout Repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           python-version: '3.10'
 
@@ -22,16 +22,22 @@ jobs:
         run: |
           python main.py
 
-      - name: Commit and Push Changes
+      - name: Commit and Push to GitHub
         run: |
           git config --local user.name "github-actions[bot]"
           git config --local user.email "github-actions[bot]@users.noreply.github.com"
-          
           git add nekoray_sub.txt
-          
           if git diff --staged --quiet; then
             echo "节点没有变化，跳过提交"
           else
             git commit -m "🤖 Auto Update: 精确剔除假SNI并更新节点订阅"
             git push
           fi
+
+      # 自动同步提交到 Gitee
+      - name: Push to Gitee
+        env:
+          GITEE_TOKEN: ${{ secrets.GITEE_TOKEN }}
+        run: |
+          git remote add gitee https://renyong_8051:${GITEE_TOKEN}@gitee.com/renyong_8051/v2ray-sub.git
+          git push -f gitee main:master
