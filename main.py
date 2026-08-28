@@ -6,12 +6,12 @@ import urllib.parse
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 
-# 1. 静态订阅源列表
+# 1. 静态订阅源列表（已适配 GitHub Actions 海外原生网络，去除代理前缀）
 SOURCES = [
     "https://raw.githubusercontent.com/zhuhaiuk/free-nodes/main/nodes.txt",
     "https://raw.githubusercontent.com/mfuu/v2ray/master/v2ray",
     "https://github.com/Au1rxx/free-vpn-subscriptions/raw/main/output/v2ray-base64.txt",
-    "https://ghfast.top/https://raw.githubusercontent.com/free18/v2ray/refs/heads/main/c.yaml",
+    "https://raw.githubusercontent.com/free18/v2ray/refs/heads/main/c.yaml",
     "https://raw.githubusercontent.com/freefq/free/master/v2",
     "https://raw.githubusercontent.com/ermaozi/get_free_proxy/main/sub"
 ]
@@ -24,8 +24,8 @@ TG_PUBLIC_CHANNELS = [
     "FreeV2RayConfig"
 ]
 
-# 联通优选关键字与黑名单
-UNICOM_FAVORITE_KEYWORDS = ['HK', '香港', 'JP', '日本', 'KR', '韩国', 'SG', '新加坡', 'US', '美国']
+# 联通/常用优选地区关键字与黑名单
+FAVORITE_KEYWORDS = ['HK', '香港', 'JP', '日本', 'KR', '韩国', 'SG', '新加坡', 'US', '美国']
 BLOCKED_IPS = {'127.0.0.1', '0.0.0.0', 'localhost', '10.0.0.0', '172.16.0.0', '192.168.0.0'}
 PROTOCOL_PATTERN = r"(?:vmess|vless|ss|trojan|socks5|hy2|hysteria2|tuic)://[a-zA-Z0-9%_\.\:\-\=\+\/\?\&\#\~\@\-\+]+"
 
@@ -154,7 +154,6 @@ def parse_node_info(node_str):
             port = int(info.get('port', 443))
             name = info.get('ps', '')
         elif node_str.startswith("ss://"):
-            # 兼容 SS 标准与 SIP002 格式
             clean_str = node_str[5:]
             if "#" in clean_str:
                 clean_str, name = clean_str.split("#", 1)
@@ -165,7 +164,6 @@ def parse_node_info(node_str):
                     host, port_str = server_part.split(":", 1)
                     port = int(port_str.split("/")[0].split("?")[0])
         elif node_str.startswith(("vless://", "trojan://", "hysteria2://", "hy2://", "tuic://")):
-            # 匹配常规协议的标准 URL 格式
             match = re.search(r'@([^:]+):(\d+)', node_str)
             if match:
                 host = match.group(1)
@@ -190,7 +188,7 @@ def check_node_quality(node_str):
             return None
 
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        sock.settimeout(1.5)  # 控制在 1.5 秒内响应
+        sock.settimeout(1.5)  # 1.5秒超时检测
         result = sock.connect_ex((ip, port))
         sock.close()
         
@@ -199,8 +197,8 @@ def check_node_quality(node_str):
             # 针对较新协议给予加分
             if node_str.startswith(("hysteria2://", "hy2://", "tuic://", "vless://")):
                 score += 20
-            # 命中地区关键字给予加分
-            for kw in UNICOM_FAVORITE_KEYWORDS:
+            # 命中常用地区关键字给予加分
+            for kw in FAVORITE_KEYWORDS:
                 if kw.lower() in name.lower() or kw.lower() in host.lower():
                     score += 50
                     break
@@ -239,7 +237,7 @@ def main():
             if res:
                 scored_nodes.append(res)
 
-    # 排序：按照得分降序，并截取前 200 个可用节点
+    # 按照得分降序，并截取前 200 个可用节点
     scored_nodes.sort(key=lambda x: x[0], reverse=True)
     final_nodes = [item[1] for item in scored_nodes[:200]]
 
