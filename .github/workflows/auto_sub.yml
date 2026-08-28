@@ -13,10 +13,10 @@ jobs:
 
     steps:
       - name: 检出源码
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: 配置 Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           python-version: '3.10'
 
@@ -37,7 +37,7 @@ jobs:
           # 创建并切换到空白的 gh-pages 分支
           git checkout --orphan gh-pages
           
-          # 仅暂存生成的节点文件（假设生成的是 nekoray_sub.txt，如有其他生成的 txt 文件一并写上）
+          # 仅暂存生成的节点文件
           git reset
           git add -f nekoray_sub.txt
           
