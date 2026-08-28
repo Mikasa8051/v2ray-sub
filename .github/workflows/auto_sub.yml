@@ -10,6 +10,7 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
+
     steps:
       - name: 检出源码
         uses: actions/checkout@v4
@@ -28,11 +29,18 @@ jobs:
         run: |
           python main.py
 
-      - name: 发布至 GitHub Pages
-        uses: peaceiris/actions-gh-pages@v4
-        with:
-          github_token: ${{ secrets.GITHUB_TOKEN }}
-          publish_dir: ./
-          destination_dir: ./
-          keep_files: false
-          exclude_assets: '.git,.github,*.py,requirements.txt'
+      - name: 发布生成结果至 gh-pages 分支
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          
+          # 创建并切换到空白的 gh-pages 分支
+          git checkout --orphan gh-pages
+          
+          # 仅暂存生成的节点文件（假设生成的是 nekoray_sub.txt，如有其他生成的 txt 文件一并写上）
+          git reset
+          git add -f nekoray_sub.txt
+          
+          # 提交并强推到 remote 的 gh-pages 分支
+          git commit -m "Auto update subscription [skip ci]"
+          git push -f origin gh-pages
