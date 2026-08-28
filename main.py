@@ -4,11 +4,13 @@ import re
 import urllib.parse
 import urllib.request
 
-# 1. 静态订阅源列表
-SOURCES = [
+# 1. 静态订阅源列表（添加镜像代理前缀，保障直连抓取）
+MIRROR_PREFIX = "https://ghp.ci/"
+
+RAW_SOURCES = [
     "https://raw.githubusercontent.com/zhuhaiuk/free-nodes/main/nodes.txt",
     "https://raw.githubusercontent.com/mfuu/v2ray/master/v2ray",
-    "https://github.com/Au1rxx/free-vpn-subscriptions/raw/main/output/v2ray-base64.txt",
+    "https://raw.githubusercontent.com/Au1rxx/free-vpn-subscriptions/main/output/v2ray-base64.txt",
     "https://raw.githubusercontent.com/free18/v2ray/refs/heads/main/c.yaml",
     "https://raw.githubusercontent.com/freefq/free/master/v2",
     "https://raw.githubusercontent.com/ermaozi/get_free_proxy/main/sub"
@@ -30,7 +32,7 @@ BLOCKED_SNIS = [
 ]
 
 PROTOCOL_PATTERN = r"(?:vmess|vless|ss|trojan|socks5|hy2|hysteria2|tuic)://[a-zA-Z0-9%_\.\:\-\=\+\/\?\&\#\~\@\-\+]+"
-HEADERS = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
+HEADERS = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'}
 
 def safe_b64decode(s):
     """安全的 Base64 解码"""
@@ -95,49 +97,62 @@ def parse_clash_yaml(yaml_text):
             continue
     return nodes
 
+def fetch_url_content(url):
+    """带镜像备用回退的抓取函数"""
+    urls_to_try = [url]
+    if "raw.githubusercontent.com" in url or "github.com" in url:
+        urls_to_try.append(MIRROR_PREFIX + url)
+
+    for target_url in urls_to_try:
+        try:
+            req = urllib.request.Request(target_url, headers=HEADERS)
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                content = resp.read().decode('utf-8', errors='ignore').strip()
+                if content:
+                    return content
+        except Exception:
+            continue
+    return ""
+
 def fetch_from_sources(url):
     """抓取源节点"""
-    try:
-        req = urllib.request.Request(url, headers=HEADERS)
-        with urllib.request.urlopen(req, timeout=10) as resp:
-            content = resp.read().decode('utf-8', errors='ignore').strip()
-            
-            if "proxies:" in content or url.endswith((".yaml", ".yml")):
-                yaml_nodes = parse_clash_yaml(content)
-                if yaml_nodes:
-                    return yaml_nodes
-
-            curr = content
-            for _ in range(3):
-                decoded = safe_b64decode(curr)
-                if decoded and any(p in decoded for p in ["vmess://", "vless://", "ss://", "trojan://"]):
-                    curr = decoded
-                else:
-                    break
-            
-            return curr.splitlines()
-    except Exception as e:
-        print(f"[-] 抓取源失败 [{url}]: {e}")
+    content = fetch_url_content(url)
+    if not content:
+        print(f"[-] 抓取源失败 [{url}]")
         return []
 
+    if "proxies:" in content or url.endswith((".yaml", ".yml")):
+        yaml_nodes = parse_clash_yaml(content)
+        if yaml_nodes:
+            return yaml_nodes
+
+    curr = content
+    for _ in range(3):
+        decoded = safe_b64decode(curr)
+        if decoded and any(p in decoded for p in ["vmess://", "vless://", "ss://", "trojan://"]):
+            curr = decoded
+        else:
+            break
+    
+    return curr.splitlines()
+
 def scrape_telegram_channels():
-    """爬取 TG 频道节点"""
+    """爬取 TG 频道节点（自动通过 Web 镜像直连）"""
     scraped_nodes = []
     for channel in TG_PUBLIC_CHANNELS:
-        url = f"https://t.me/s/{channel}"
-        try:
-            print(f"[*] [TG爬虫] 正在爬取频道: @{channel}")
-            req = urllib.request.Request(url, headers=HEADERS)
-            with urllib.request.urlopen(req, timeout=10) as resp:
-                html = resp.read().decode('utf-8', errors='ignore')
-                matches = re.findall(PROTOCOL_PATTERN, html)
-                scraped_nodes.extend(matches)
-                
-                decoded = safe_b64decode(html)
-                if decoded:
-                    scraped_nodes.extend(re.findall(PROTOCOL_PATTERN, decoded))
-        except Exception as e:
-            print(f"[-] 爬取 TG 频道 @{channel} 失败: {e}")
+        # 使用 telegram.dog 替换被墙的 t.me
+        url = f"https://telegram.dog/s/{channel}"
+        print(f"[*] [TG爬虫] 正在爬取频道: @{channel}")
+        html = fetch_url_content(url)
+        if html:
+            matches = re.findall(PROTOCOL_PATTERN, html)
+            scraped_nodes.extend(matches)
+            
+            decoded = safe_b64decode(html)
+            if decoded:
+                scraped_nodes.extend(re.findall(PROTOCOL_PATTERN, decoded))
+        else:
+            print(f"[-] 爬取 TG 频道 @{channel} 失败")
     return scraped_nodes
 
 def is_blacklisted_sni(node_str):
@@ -152,7 +167,7 @@ def main():
     all_raw_nodes = []
 
     print("[+] 阶段 1: 正在拉取静态订阅源节点...")
-    for src in SOURCES:
+    for src in RAW_SOURCES:
         nodes = fetch_from_sources(src)
         all_raw_nodes.extend(nodes)
 
