@@ -12,6 +12,8 @@ jobs:
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v5
+        with:
+          fetch-depth: 0  # 关键修复：禁用浅克隆，拉取完整 Git 提交历史
 
       - name: Set up Python
         uses: actions/setup-python@v6
