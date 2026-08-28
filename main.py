@@ -22,7 +22,7 @@ TG_PUBLIC_CHANNELS = [
     "FreeV2RayConfig"
 ]
 
-# 指定拦截的精确伪造 SNI / 假节点黑名单
+# 精确指定要强行拦截并屏蔽的伪造 SNI / 假节点域名黑名单
 BLOCKED_SNIS = [
     "u729792us3017.wagahaha.xyz",
     "www.ignitelimit.com",
@@ -96,7 +96,7 @@ def parse_clash_yaml(yaml_text):
     return nodes
 
 def fetch_from_sources(url):
-    """拉取静态订阅源"""
+    """抓取源节点"""
     try:
         req = urllib.request.Request(url, headers=HEADERS)
         with urllib.request.urlopen(req, timeout=10) as resp:
@@ -140,8 +140,8 @@ def scrape_telegram_channels():
             print(f"[-] 爬取 TG 频道 @{channel} 失败: {e}")
     return scraped_nodes
 
-def filter_blacklisted_sni(node_str):
-    """精确过滤三条指定的伪 SNI 域名"""
+def is_blacklisted_sni(node_str):
+    """判断节点是否包含指定的 3 条黑名单域名"""
     node_lower = node_str.lower()
     for blocked in BLOCKED_SNIS:
         if blocked.lower() in node_lower:
@@ -160,7 +160,7 @@ def main():
     tg_nodes = scrape_telegram_channels()
     all_raw_nodes.extend(tg_nodes)
 
-    # 提取格式规范的节点
+    # 格式过滤
     valid_format_nodes = []
     for n in all_raw_nodes:
         n_clean = n.strip()
@@ -175,13 +175,13 @@ def main():
     clean_nodes = []
     blocked_count = 0
     for node in unique_nodes:
-        if filter_blacklisted_sni(node):
+        if is_blacklisted_sni(node):
             blocked_count += 1
         else:
             clean_nodes.append(node)
 
-    print(f"[+] 拦截剔除指定黑名单节点: {blocked_count} 个")
-    print(f"[+] 最终保留有效节点总数: {len(clean_nodes)} 个")
+    print(f"[+] 拦截剔除指定黑名单伪节点: {blocked_count} 个")
+    print(f"[+] 最终保留节点总数: {len(clean_nodes)} 个")
 
     # 导出 Base64 订阅文件
     sub_content = "\n".join(clean_nodes)
