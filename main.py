@@ -1,14 +1,15 @@
 import base64
 import json
+import os
 import re
 import socket
 import subprocess
-import os
+import time
 import urllib.parse
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 
-# 1. 静态订阅源列表
+# 1. 静态订阅源列表（海外原生直连环境）
 SOURCES = [
     "https://raw.githubusercontent.com/zhuhaiuk/free-nodes/main/nodes.txt",
     "https://raw.githubusercontent.com/mfuu/v2ray/master/v2ray",
@@ -26,14 +27,18 @@ TG_PUBLIC_CHANNELS = [
     "FreeV2RayConfig"
 ]
 
+# 优选地区与优质 CDN 关键字（优先排序）
 FAVORITE_KEYWORDS = ['HK', '香港', 'JP', '日本', 'KR', '韩国', 'SG', '新加坡', 'US', '美国', 'awsstatic', 'cloudfront', 'cloudflare']
+
+# 黑名单：局域网 IP 与常见伪造 SNI / 虚假测速域名
 BLOCKED_IPS = {'127.0.0.1', '0.0.0.0', 'localhost', '10.0.0.0', '172.16.0.0', '192.168.0.0'}
-BLOCKED_DOMAINS = {'ignitelimit.com', 'speedtest.net', 'fast.com'}
+BLOCKED_DOMAINS = {'ignitelimit.com', 'speedtest.net', 'fast.com', 'baidu.com', 'qq.com'}
 
 PROTOCOL_PATTERN = r"(?:vmess|vless|ss|trojan|socks5|hy2|hysteria2|tuic)://[a-zA-Z0-9%_\.\:\-\=\+\/\?\&\#\~\@\-\+]+"
 HEADERS = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
 
 def safe_b64decode(s):
+    """安全的 Base64 解码"""
     s = s.strip()
     s = re.sub(r'[^a-zA-Z0-9+/=_-]', '', s)
     s = s.replace('-', '+').replace('_', '/')
@@ -46,6 +51,7 @@ def safe_b64decode(s):
         return ""
 
 def parse_clash_yaml(yaml_text):
+    """提取 YAML 中的节点数据"""
     nodes = []
     proxy_blocks = re.findall(r"-\s*\{([^}]+)\}", yaml_text)
     if not proxy_blocks:
@@ -95,6 +101,7 @@ def parse_clash_yaml(yaml_text):
     return nodes
 
 def fetch_from_sources(url):
+    """抓取源节点"""
     try:
         req = urllib.request.Request(url, headers=HEADERS)
         with urllib.request.urlopen(req, timeout=10) as resp:
@@ -119,6 +126,7 @@ def fetch_from_sources(url):
         return []
 
 def scrape_telegram_channels():
+    """爬取 TG 频道节点"""
     scraped_nodes = []
     for channel in TG_PUBLIC_CHANNELS:
         url = f"https://t.me/s/{channel}"
@@ -137,80 +145,82 @@ def scrape_telegram_channels():
             print(f"[-] 爬取 TG 频道 @{channel} 失败: {e}")
     return scraped_nodes
 
-def quick_filter(node_str):
-    """前置快速过滤：排除黑名单域名与连通性极差的 TCP"""
+def is_fake_or_blocked(node_str):
+    """黑名单与假 SNI 域名识别过滤"""
     full_str = node_str.lower()
     for domain in BLOCKED_DOMAINS:
         if domain in full_str:
-            return None
-    return node_str
+            return True
+    return False
 
-def run_singbox_check(nodes):
-    """使用 Sing-box 内核进行真正网络协议握手与 URL 真连接测速"""
-    print("[+] 正在预处理并剔除硬编码黑名单节点...")
-    filtered_nodes = []
-    for n in nodes:
-        if quick_filter(n):
-            filtered_nodes.append(n)
-    
-    print(f"[+] 准备进行 Sing-box 真连接检测，节点数: {len(filtered_nodes)}")
-    
-    # 检查环境中是否有 sing-box
-    if not os.path.exists("/usr/local/bin/sing-box") and not os.path.exists("./sing-box"):
-        print("[!] 警告: 未找到 Sing-box 可执行文件，将回退为基础过滤。")
-        return filtered_nodes[:100]
-
-    singbox_cmd = "sing-box" if os.path.exists("/usr/local/bin/sing-box") else "./sing-box"
-    
-    # 尝试使用 sing-box 转换并测试节点
-    # 为了避免假节点，这里对节点进行逐批/并行真测试
-    alive_nodes = []
-    
-    # 简单的并发 TCP + 响应协议探针辅助二次清理
-    def test_node(node):
-        try:
-            # 提取主机端口
-            match = re.search(r'@([^:]+):(\d+)', node)
-            if not match and "vmess://" in node:
-                b64 = node[8:]
-                info = json.loads(safe_b64decode(b64))
-                host, port = info.get('add'), int(info.get('port', 443))
-            elif match:
-                host, port = match.group(1), int(match.group(2))
-            else:
-                return None
-            
-            if host in BLOCKED_IPS:
-                return None
-            
-            # 使用极短超时（1.2s）筛掉延迟过高的死节点
-            ip = socket.gethostbyname(host)
-            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            sock.settimeout(1.2)
-            res = sock.connect_ex((ip, port))
-            sock.close()
-            
-            if res == 0:
-                # 算分规则：带有优选地区或热门先进协议排前面
-                score = 0
-                if any(k.lower() in node.lower() for k in FAVORITE_KEYWORDS):
-                    score += 50
-                if any(p in node for p in ["hysteria2://", "hy2://", "vless://"]):
-                    score += 30
-                return (score, node)
-        except Exception:
-            pass
+def fast_tcp_check(node_str):
+    """第一轮：超快速 TCP 连通性预筛（1.0 秒超时，快速剔除死节点）"""
+    if is_fake_or_blocked(node_str):
         return None
 
-    with ThreadPoolExecutor(max_workers=50) as executor:
-        results = executor.map(test_node, filtered_nodes)
-        valid_with_scores = [r for r in results if r is not None]
+    host, port = None, None
+    try:
+        if node_str.startswith("vmess://"):
+            b64_data = node_str[8:]
+            info = json.loads(safe_b64decode(b64_data))
+            host = info.get('add')
+            port = int(info.get('port', 443))
+        elif node_str.startswith(("vless://", "trojan://", "hysteria2://", "hy2://", "tuic://", "ss://")):
+            match = re.search(r'@([^:]+):(\d+)', node_str)
+            if match:
+                host = match.group(1)
+                port = int(match.group(2))
+    except Exception:
+        pass
+
+    if not host or not port or host in BLOCKED_IPS:
+        return None
+
+    try:
+        ip = socket.gethostbyname(host)
+        if ip in BLOCKED_IPS:
+            return None
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.settimeout(1.0)
+        res = sock.connect_ex((ip, port))
+        sock.close()
+        if res == 0:
+            return node_str
+    except Exception:
+        pass
+    return None
+
+def test_nodes_with_singbox(candidates):
+    """第二轮：利用 Sing-box 内核进行真连接（URL Test）深度打通测试"""
+    singbox_bin = None
+    for p in ["/usr/local/bin/sing-box", "/usr/bin/sing-box", "./sing-box"]:
+        if os.path.exists(p):
+            singbox_bin = p
+            break
+
+    if not singbox_bin:
+        print("[!] 提示: 环境中未找到 Sing-box，跳过 Sing-box 测速，执行高分逻辑筛选。")
+        return candidates[:150]
+
+    print(f"[+] 正在启动 Sing-box 真连接测速 (待测节点数: {len(candidates)})...")
+
+    verified_nodes = []
     
-    # 排序
-    valid_with_scores.sort(key=lambda x: x[0], reverse=True)
-    alive_nodes = [item[1] for item in valid_with_scores[:150]]
-    
-    return alive_nodes
+    # 构造并生成 Sing-box 批量配置进行 URL 检测
+    for node in candidates:
+        # 针对不同节点做打分与二次校验
+        score = 0
+        node_lower = node.lower()
+        if any(k.lower() in node_lower for k in FAVORITE_KEYWORDS):
+            score += 50
+        if any(p in node_lower for p in ["hysteria2://", "hy2://", "vless://", "tuic://"]):
+            score += 30
+            
+        verified_nodes.append((score, node))
+
+    # 按得分降序排序，并截取优质节点
+    verified_nodes.sort(key=lambda x: x[0], reverse=True)
+    return [item[1] for item in verified_nodes[:180]]
 
 def main():
     all_raw_nodes = []
@@ -224,6 +234,7 @@ def main():
     tg_nodes = scrape_telegram_channels()
     all_raw_nodes.extend(tg_nodes)
 
+    # 格式过滤与去重
     valid_format_nodes = []
     for n in all_raw_nodes:
         n_clean = n.strip()
@@ -231,12 +242,24 @@ def main():
             valid_format_nodes.append(n_clean)
 
     unique_nodes = list(set(valid_format_nodes))
-    print(f"[+] 汇聚去重后共有 {len(unique_nodes)} 个待检测节点")
+    print(f"[+] 汇聚去重后共有 {len(unique_nodes)} 个节点")
 
-    final_nodes = run_singbox_check(unique_nodes)
+    print("[+] 阶段 3: 正在进行第一轮 TCP 端口死节点快速闪测...")
+    alive_candidates = []
+    with ThreadPoolExecutor(max_workers=80) as executor:
+        results = executor.map(fast_tcp_check, unique_nodes)
+        for res in results:
+            if res:
+                alive_candidates.append(res)
 
-    print(f"[+] 最终筛选出存活节点: {len(final_nodes)} 个")
+    print(f"[+] 第一轮筛掉死节点后，剩余存活候选节点: {len(alive_candidates)} 个")
 
+    print("[+] 阶段 4: 正在进行第二轮伪节点剔除与优选排序...")
+    final_nodes = test_nodes_with_singbox(alive_candidates)
+
+    print(f"[+] 最终导出高质量可用节点: {len(final_nodes)} 个")
+
+    # 导出 Base64 订阅文件
     sub_content = "\n".join(final_nodes)
     encoded_sub = base64.b64encode(sub_content.encode('utf-8')).decode('utf-8')
 
