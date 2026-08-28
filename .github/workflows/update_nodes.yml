@@ -38,5 +38,5 @@ jobs:
         env:
           GITEE_TOKEN: ${{ secrets.GITEE_TOKEN }}
         run: |
-          git remote add gitee https://oauth2:${GITEE_TOKEN}@gitee.com/renyong_8051/v2ray-sub.git
-          git push -f gitee main:master
+          git remote add gitee https://oauth2:${GITEE_TOKEN}@gitee.com/renyong_8051/giehub.git
+          git push -f gitee main:master || git push -f gitee main:main
