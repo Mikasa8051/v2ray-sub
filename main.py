@@ -2,10 +2,10 @@ import base64
 import json
 import os
 import re
-import subprocess
-import time
+import socket
 import urllib.parse
 import urllib.request
+import concurrent.futures
 
 # ==================== 配置区 ====================
 
@@ -35,18 +35,16 @@ BLOCKED_SNIS = [
 
 INVALID_HOSTS = ["127.0.0.1", "0.0.0.0", "localhost"]
 
-# 真实测速参数
-TEST_URL = "https://speed.cloudflare.com/__down?bytes=5000000"  # 下载 5MB 测试文件测速
-DOWNLOAD_TIMEOUT = 4.0      # 单个节点测速超时时间（秒）
-MIN_SPEED_KBS = 200.0       # 最低保留网速阈值 (KB/s)，低于此速度直接剔除
-TOP_NODE_LIMIT = 200        # 最终精选保留的最大高效节点数
-
-LOCAL_PROXY_PORT = 10808    # sing-box 本地代理端口
 MIRROR_PREFIX = "https://ghp.ci/"
 PROTOCOL_PATTERN = r"(?:vmess|vless|ss|trojan|socks5|hy2|hysteria2|tuic)://[a-zA-Z0-9%_\.\:\-\=\+\/\?\&\#\~\@\-\+]+"
 HEADERS = {
     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
 }
+
+# TCP 端口连通性过滤参数
+ENABLE_TCP_CHECK = True    # 是否开启端口连通性初步过滤（过滤完全宕机的服务器）
+TCP_TIMEOUT = 2.0          # TCP 建连超时（秒）
+MAX_WORKERS = 30           # 检查线程数
 
 # ==================== 工具函数 ====================
 
@@ -168,135 +166,32 @@ def is_blacklisted(node_str: str) -> bool:
             return True
     return False
 
-# ==================== sing-box 动态测速核心 ====================
+# ==================== 极速 TCP 连通性测试 ====================
 
-def generate_singbox_config(outbound_json: dict) -> dict:
-    return {
-        "log": {"level": "warn"},
-        "inbounds": [
-            {
-                "type": "http",
-                "tag": "http-in",
-                "listen": "127.0.0.1",
-                "listen_port": LOCAL_PROXY_PORT
-            }
-        ],
-        "outbounds": [
-            outbound_json,
-            {"type": "direct", "tag": "direct"}
-        ]
-    }
-
-def parse_singbox_outbound(node_str: str):
+def extract_host_port(node_str: str):
     try:
         if node_str.startswith("vmess://"):
             js = json.loads(safe_b64decode(node_str[8:]))
-            return {
-                "type": "vmess",
-                "tag": "proxy",
-                "server": js.get("add"),
-                "server_port": int(js.get("port", 443)),
-                "uuid": js.get("id"),
-                "security": "auto",
-                "tls": {"enabled": js.get("tls") == "tls", "insecure": True} if js.get("tls") == "tls" else {}
-            }
-        elif node_str.startswith("vless://"):
+            return js.get("add"), int(js.get("port", 443))
+        else:
             parsed = urllib.parse.urlparse(node_str)
-            query = urllib.parse.parse_qs(parsed.query)
-            uuid = parsed.username
-            return {
-                "type": "vless",
-                "tag": "proxy",
-                "server": parsed.hostname,
-                "server_port": parsed.port or 443,
-                "uuid": uuid,
-                "tls": {"enabled": True, "insecure": True} if "tls" in query.get("security", [""]) else {}
-            }
-        elif node_str.startswith("trojan://"):
-            parsed = urllib.parse.urlparse(node_str)
-            return {
-                "type": "trojan",
-                "tag": "proxy",
-                "server": parsed.hostname,
-                "server_port": parsed.port or 443,
-                "password": parsed.username,
-                "tls": {"enabled": True, "insecure": True}
-            }
-        elif node_str.startswith("ss://"):
-            parsed = urllib.parse.urlparse(node_str)
-            user_info = safe_b64decode(parsed.username) if parsed.username else ""
-            if ":" in user_info:
-                method, password = user_info.split(":", 1)
-                return {
-                    "type": "shadowsocks",
-                    "tag": "proxy",
-                    "server": parsed.hostname,
-                    "server_port": parsed.port,
-                    "method": method,
-                    "password": password
-                }
+            return parsed.hostname, parsed.port or 443
     except Exception:
-        pass
-    return None
+        return None, None
 
-def measure_download_speed_via_proxy(node_str: str) -> float:
-    outbound = parse_singbox_outbound(node_str)
-    if not outbound:
-        return 0.0
+def check_tcp_alive(node_str: str) -> bool:
+    host, port = extract_host_port(node_str)
+    if not host or not port:
+        return True  # 无法解析出的常规链接直接放行，由本地客户端测试
 
-    config = generate_singbox_config(outbound)
-    config_file = f"temp_config_{os.getpid()}.json"
-    
-    speed_kbs = 0.0
-    proc = None
     try:
-        with open(config_file, "w", encoding="utf-8") as f:
-            json.dump(config, f)
-
-        proc = subprocess.Popen(
-            ["sing-box", "run", "-c", config_file], 
-            stdout=subprocess.DEVNULL, 
-            stderr=subprocess.DEVNULL
-        )
-        time.sleep(0.4)
-
-        proxy_handler = urllib.request.ProxyHandler({
-            'http': f'http://127.0.0.1:{LOCAL_PROXY_PORT}', 
-            'https': f'http://127.0.0.1:{LOCAL_PROXY_PORT}'
-        })
-        opener = urllib.request.build_opener(proxy_handler)
-
-        start_time = time.time()
-        req = urllib.request.Request(TEST_URL, headers={'User-Agent': 'Mozilla/5.0'})
-        with opener.open(req, timeout=DOWNLOAD_TIMEOUT) as response:
-            bytes_downloaded = 0
-            while True:
-                chunk = response.read(65536)
-                if not chunk:
-                    break
-                bytes_downloaded += len(chunk)
-                if time.time() - start_time > DOWNLOAD_TIMEOUT:
-                    break
-
-            duration = time.time() - start_time
-            if duration > 0 and bytes_downloaded > 0:
-                speed_kbs = (bytes_downloaded / 1024.0) / duration
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.settimeout(TCP_TIMEOUT)
+        sock.connect((host, port))
+        sock.close()
+        return True
     except Exception:
-        speed_kbs = 0.0
-    finally:
-        if proc:
-            try:
-                proc.kill()
-                proc.wait()
-            except Exception:
-                pass
-        if os.path.exists(config_file):
-            try:
-                os.remove(config_file)
-            except Exception:
-                pass
-
-    return speed_kbs
+        return False
 
 # ==================== 主逻辑 ====================
 
@@ -310,39 +205,30 @@ def main():
     print("[+] 正在爬取 Telegram 公开频道节点...")
     all_raw_nodes.extend(scrape_telegram_channels())
 
+    # 规范化与过滤
     valid_format_nodes = [n.strip() for n in all_raw_nodes if re.match(PROTOCOL_PATTERN, n.strip()) and not is_blacklisted(n.strip())]
     unique_nodes = list(set(valid_format_nodes))
     total_count = len(unique_nodes)
-    print(f"[+] 汇聚去重并过滤黑名单后共有 {total_count} 个待测节点")
+    print(f"[+] 汇聚去重后共有 {total_count} 个节点")
 
-    print(f"[+] [方案 B] 正在调用 sing-box 进行【真实文件下载流量测速】...")
-    speed_results = []
-    
-    candidate_nodes = unique_nodes[:600]
-    
-    for idx, node in enumerate(candidate_nodes, 1):
-        speed = measure_download_speed_via_proxy(node)
-        if speed >= MIN_SPEED_KBS:
-            speed_results.append((node, speed))
-            print(f"[{idx}/{len(candidate_nodes)}] 节点可真实连接 -> 速度: {speed:.1f} KB/s")
-        else:
-            if idx % 50 == 0:
-                print(f"[{idx}/{len(candidate_nodes)}] 测速推进中... (已找到 {len(speed_results)} 个高速节点)")
+    final_nodes = []
+    if ENABLE_TCP_CHECK:
+        print(f"[+] 启动极速 TCP 端口可用性检测 (线程数: {MAX_WORKERS})...")
+        with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+            future_to_node = {executor.submit(check_tcp_alive, node): node for node in unique_nodes}
+            for future in concurrent.futures.as_completed(future_to_node):
+                node = future_to_node[future]
+                try:
+                    if future.result():
+                        final_nodes.append(node)
+                except Exception:
+                    pass
+        print(f"[+] 端口存活检测完成：保留 {len(final_nodes)} / {total_count} 个节点")
+    else:
+        final_nodes = unique_nodes
 
-    print(f"\n[+] 测速完成！共获取到 {len(speed_results)} 个高速节点（网速 >= {MIN_SPEED_KBS} KB/s）")
-
-    # 按网速从大到小降序排列
-    speed_results.sort(key=lambda x: x[1], reverse=True)
-
-    # 截取网速前 200 名
-    top_nodes = speed_results[:TOP_NODE_LIMIT]
-    top_clean_nodes = [item[0] for item in top_nodes]
-
-    if top_nodes:
-        print(f"[+] 精选完成：已保留前 {len(top_clean_nodes)} 个最高速节点（最高速度: {top_nodes[0][1]/1024:.2f} MB/s）")
-
-    # 输出文件
-    sub_content = "\n".join(top_clean_nodes)
+    # 输出 base64 订阅文件
+    sub_content = "\n".join(final_nodes)
     encoded_sub = base64.b64encode(sub_content.encode('utf-8')).decode('utf-8')
 
     os.makedirs("public", exist_ok=True)
