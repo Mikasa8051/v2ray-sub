@@ -2,241 +2,275 @@ import base64
 import json
 import os
 import re
-import socket
-import ssl
-import time
 import urllib.parse
 import urllib.request
-import concurrent.futures
 
-# ==================== 1. 订阅源与 TG 频道配置 ====================
+# ==================== 配置区 ====================
 
-SOURCES = [
-    "https://raw.githubusercontent.com/freefq/free/master/v2",
-    "https://raw.githubusercontent.com/pawdroid/Free-servers/main/sub",
-    "https://raw.githubusercontent.com/ermaozi/get_subscribe/main/subscribe/v2ray.txt",
+# 1. 静态订阅源列表
+RAW_SOURCES = [
+    "https://raw.githubusercontent.com/zhuhaiuk/free-nodes/main/nodes.txt",
     "https://raw.githubusercontent.com/mfuu/v2ray/master/v2ray",
-    "https://raw.githubusercontent.com/SoliSpirit/v2ray-configs/main/Protocols/vless.txt",
-    "https://fastly.jsdelivr.net/gh/ALIILAPRO/v2rayng-config@master/sub.txt",
-    "https://raw.githubusercontent.com/peasoft/NoMoreWalls/master/list.txt",
-    "https://raw.githubusercontent.com/roosterkid/openproxylist/main/V2RAY_RAW.txt",
-    "https://raw.githubusercontent.com/w2ray/v2ray/main/v2ray",
-    "https://raw.githubusercontent.com/fsub/v2ray/main/sub",
-    "https://raw.githubusercontent.com/Emerge-Nodes/Emerge-Nodes/main/sub",
-    "https://raw.githubusercontent.com/vless-node/vless-node/main/vless.txt",
-    "https://raw.githubusercontent.com/mftzgv/Free-Node-Merge/main/out/nodes.txt"
+    "https://raw.githubusercontent.com/Au1rxx/free-vpn-subscriptions/main/output/v2ray-base64.txt",
+    "https://raw.githubusercontent.com/free18/v2ray/refs/heads/main/c.yaml",
+    "https://raw.githubusercontent.com/freefq/free/master/v2",
+    "https://raw.githubusercontent.com/ermaozi/get_free_proxy/main/sub"
 ]
 
-TG_CHANNELS = [
+# 2. Telegram 公开频道列表
+TG_PUBLIC_CHANNELS = [
     "v2ray_free_conf",
     "Freev2rays",
     "v2ray_free_nodes",
     "FreeV2RayConfig"
 ]
 
+# 3. 指定强行拦截剔除的伪造 SNI / 假节点域名黑名单
+BLOCKED_SNIS = [
+    "u729792us3017.wagahaha.xyz",
+    "www.ignitelimit.com",
+    "www.cloudflare.com"
+]
+
+# CDN 加速镜像前缀，用于 GitHub 静态源直连备用回退
 MIRROR_PREFIX = "https://ghp.ci/"
+
+# 改进后的通用正则（精准抓取至空白字符或 HTML 结束符）
+PROTOCOL_PATTERN = r"(?:vmess|vless|ss|trojan|socks5|hy2|hysteria2|tuic)://[^\s<'\"]+"
+
 HEADERS = {
-    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
 }
 
-# ==================== 2. 基础解包与清洗工具 ====================
+# ==================== 工具函数 ====================
 
-def safe_b64decode(data: str) -> str:
-    """安全 Base64 解码，处理 padding 与非标准字符"""
-    data = data.strip().replace('\r', '').replace('\n', '')
-    data = re.sub(r'[^a-zA-Z0-9+/=_-]', '', data)
-    data = data.replace('-', '+').replace('_', '/')
-    missing = len(data) % 4
-    if missing:
-        data += '=' * (4 - missing)
+def safe_b64decode(s: str) -> str:
+    """安全的 Base64 解码函数"""
+    s = s.strip().replace('\r', '').replace('\n', '')
+    s = re.sub(r'[^a-zA-Z0-9+/=_-]', '', s)
+    s = s.replace('-', '+').replace('_', '/')
+    missing_padding = len(s) % 4
+    if missing_padding:
+        s += '=' * (4 - missing_padding)
     try:
-        return base64.b64decode(data).decode('utf-8', errors='ignore')
+        return base64.b64decode(s).decode('utf-8', errors='ignore')
     except Exception:
         return ""
 
-def fetch_url(url: str) -> str:
-    """拉取 URL 内容（含 GitHub 镜像回退）"""
-    targets = [url]
-    if "raw.githubusercontent.com" in url or "github.com" in url:
-        targets.append(MIRROR_PREFIX + url)
+def parse_clash_yaml(yaml_text: str) -> list:
+    """提取并转换 YAML/Clash 格式中的节点数据"""
+    nodes = []
+    proxy_blocks = re.findall(r"-\s*\{([^}]+)\}", yaml_text)
+    if not proxy_blocks:
+        proxy_blocks = re.findall(r"-\s*name:\s*(.*?)(?=\n-\s*name:|\n\s*proxy-groups:|$)", yaml_text, re.S)
 
-    for target in targets:
+    for block in proxy_blocks:
         try:
-            req = urllib.request.Request(target, headers=HEADERS)
-            with urllib.request.urlopen(req, timeout=8) as resp:
-                text = resp.read().decode('utf-8', errors='ignore').strip()
-                if text:
-                    return text
+            kv = {}
+            lines = block.split(',') if '{' in block else block.splitlines()
+            for item in lines:
+                if ':' in item:
+                    k, v = item.split(':', 1)
+                    kv[k.strip().strip("- ")] = v.strip().strip("'\"")
+
+            p_type = kv.get("type", "").lower()
+            name = urllib.parse.quote(kv.get("name", "Node"))
+            server = kv.get("server", "")
+            port = kv.get("port", "")
+
+            if not server or not port:
+                continue
+
+            if p_type == "ss":
+                cipher = kv.get("cipher", "")
+                password = kv.get("password", "")
+                userinfo = base64.b64encode(f"{cipher}:{password}".encode()).decode()
+                nodes.append(f"ss://{userinfo}@{server}:{port}#{name}")
+            elif p_type in ("vmess", "vless"):
+                uuid = kv.get("uuid", "")
+                if p_type == "vmess":
+                    v_json = {
+                        "v": "2", "ps": kv.get("name", "Node"), "add": server,
+                        "port": port, "id": uuid, "aid": kv.get("alterId", "0"),
+                        "net": kv.get("network", "tcp"), "type": "none",
+                        "tls": "tls" if kv.get("tls") == "true" else ""
+                    }
+                    nodes.append(f"vmess://{base64.b64encode(json.dumps(v_json).encode()).decode()}")
+                else:
+                    nodes.append(f"vless://{uuid}@{server}:{port}?type={kv.get('network', 'tcp')}#{name}")
+            elif p_type == "trojan":
+                password = kv.get("password", "")
+                nodes.append(f"trojan://{password}@{server}:{port}#{name}")
+            elif p_type in ("hysteria2", "hy2"):
+                auth = kv.get("password", "") or kv.get("auth", "")
+                nodes.append(f"hysteria2://{auth}@{server}:{port}#{name}")
+        except Exception:
+            continue
+    return nodes
+
+def fetch_url_content(url: str) -> str:
+    """网络请求函数（支持自动回退至 CDN 镜像源）"""
+    urls_to_try = [url]
+    if "raw.githubusercontent.com" in url or "github.com" in url:
+        urls_to_try.append(MIRROR_PREFIX + url)
+
+    for target_url in urls_to_try:
+        try:
+            req = urllib.request.Request(target_url, headers=HEADERS)
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                content = resp.read().decode('utf-8', errors='ignore').strip()
+                if content:
+                    return content
         except Exception:
             continue
     return ""
 
-def extract_nodes_from_text(text: str) -> list:
-    """递归解包与提取所有符合协议格式的节点"""
-    if not text:
+def fetch_from_sources(url: str) -> list:
+    """从静态源解析节点数据"""
+    content = fetch_url_content(url)
+    if not content:
+        print(f"[-] 抓取源失败 [{url}]")
         return []
 
-    # 1. 尝试多层 Base64 解码
-    curr_text = text
+    if "proxies:" in content or url.endswith((".yaml", ".yml")):
+        yaml_nodes = parse_clash_yaml(content)
+        if yaml_nodes:
+            return yaml_nodes
+
+    curr = content
     for _ in range(3):
-        decoded = safe_b64decode(curr_text)
-        if decoded and any(proto in decoded for proto in ["vmess://", "vless://", "ss://", "trojan://"]):
-            curr_text = decoded
+        decoded = safe_b64decode(curr)
+        if decoded and any(p in decoded for p in ["vmess://", "vless://", "ss://", "trojan://"]):
+            curr = decoded
         else:
             break
+    
+    return curr.splitlines()
 
-    # 2. 正则抓取节点链接并剥离网页/HTML污染
-    pattern = r"(?:vmess|vless|ss|trojan|hy2|hysteria2|tuic)://[^\s<'\"]+"
-    raw_matches = re.findall(pattern, curr_text)
+def scrape_telegram_channels() -> list:
+    """从 Telegram 公开 Web 页面提取节点数据（支持双域名自动备用）"""
+    scraped_nodes = []
+    for channel in TG_PUBLIC_CHANNELS:
+        print(f"[*] [TG爬虫] 正在爬取频道: @{channel}")
+        urls = [f"https://t.me/s/{channel}", f"https://telegram.dog/s/{channel}"]
+        html = ""
+        for u in urls:
+            html = fetch_url_content(u)
+            if html:
+                break
+        
+        if html:
+            matches = re.findall(PROTOCOL_PATTERN, html)
+            scraped_nodes.extend(matches)
+            
+            decoded = safe_b64decode(html)
+            if decoded:
+                scraped_nodes.extend(re.findall(PROTOCOL_PATTERN, decoded))
+        else:
+            print(f"[-] 爬取 TG 频道 @{channel} 失败")
+    return scraped_nodes
 
-    cleaned_nodes = []
-    for m in raw_matches:
-        m = re.sub(r'<[^>]+>', '', m).strip()
-        if len(m) > 10:
-            cleaned_nodes.append(m)
-    return cleaned_nodes
+def extract_node_domains(node_str: str) -> list:
+    """【核心修复】深层解包节点提取真正的 Address, Host, SNI, Peer 域名"""
+    domains = [node_str.lower()]
 
-def fetch_telegram_nodes(channel: str) -> list:
-    """抓取 Telegram 公开频道的节点"""
-    url = f"https://t.me/s/{channel}"
-    html = fetch_url(url)
-    if not html:
-        # 尝试备用 Web 域名
-        url_alt = f"https://telegram.dog/s/{channel}"
-        html = fetch_url(url_alt)
-    return extract_nodes_from_text(html)
-
-# ==================== 3. 节点网络地址解析器 ====================
-
-def parse_host_port(node_url: str):
-    """从节点链接中解析物理 Host 与 Port"""
     try:
-        if node_url.startswith("vmess://"):
-            b64_str = node_url[8:]
-            decoded = safe_b64decode(b64_str)
-            js = json.loads(decoded)
-            return js.get("add"), int(js.get("port", 443))
+        # 1. 针对 VMess 进行 Base64 + JSON 解包
+        if node_str.startswith("vmess://"):
+            b64_data = node_str[8:]
+            decoded_json = safe_b64decode(b64_data)
+            if decoded_json:
+                js = json.loads(decoded_json)
+                for key in ["add", "host", "sni"]:
+                    if js.get(key):
+                        domains.append(str(js.get(key)).lower())
 
-        elif node_url.startswith("ss://"):
-            clean = node_url[5:].split('#')[0]
-            if '@' in clean:
-                server_part = clean.split('@', 1)[1]
-            else:
-                decoded = safe_b64decode(clean)
-                if '@' in decoded:
-                    server_part = decoded.split('@', 1)[1]
+        # 2. 针对其他协议解析 URL 域名及 URL 参数 (sni, host, peer)
+        else:
+            parsed = urllib.parse.urlparse(node_str)
+            if parsed.hostname:
+                domains.append(parsed.hostname.lower())
+
+            query_params = urllib.parse.parse_qs(parsed.query)
+            for key in ["sni", "host", "peer"]:
+                if key in query_params:
+                    for val in query_params[key]:
+                        domains.append(val.lower())
+
+            # 特殊处理 Shadowsocks Base64 结构
+            if node_str.startswith("ss://"):
+                raw_ss = node_str[5:].split('#')[0]
+                if '@' in raw_ss:
+                    server_part = raw_ss.split('@', 1)[1]
                 else:
-                    return None, None
-            host, port = server_part.rsplit(':', 1)
-            return host, int(port)
-
-        else:  # vless, trojan, hy2, hysteria2, tuic
-            parsed = urllib.parse.urlparse(node_url)
-            if parsed.hostname and parsed.port:
-                return parsed.hostname, int(parsed.port)
-            elif parsed.hostname:
-                return parsed.hostname, 443
+                    decoded_ss = safe_b64decode(raw_ss)
+                    server_part = decoded_ss.split('@', 1)[1] if '@' in decoded_ss else ""
+                if ':' in server_part:
+                    domains.append(server_part.split(':', 1)[0].lower())
     except Exception:
         pass
-    return None, None
 
-# ==================== 4. 真实网络探测器 ====================
+    return domains
 
-def ping_test(host: str, port: int, timeout: float = 1.2) -> float:
-    """TCP / SSL 基础连通性握手测试"""
-    start = time.time()
-    try:
-        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        sock.settimeout(timeout)
-        sock.connect((host, port))
+def is_blacklisted_sni(node_str: str) -> bool:
+    """精准检测节点解包后的真实 SNI/Host 是否命中黑名单"""
+    extracted_domains = extract_node_domains(node_str)
+    for blocked in BLOCKED_SNIS:
+        blocked_lower = blocked.lower()
+        for domain in extracted_domains:
+            if blocked_lower in domain:
+                return True
+    return False
 
-        # 针对 443 端口进行简易 TLS 握手测试
-        if port == 443:
-            ctx = ssl.create_default_context()
-            ctx.check_hostname = False
-            ctx.verify_mode = ssl.CERT_NONE
-            ssl_sock = ctx.wrap_socket(sock, server_hostname=host)
-            ssl_sock.close()
-        else:
-            sock.close()
-
-        return (time.time() - start) * 1000
-    except Exception:
-        return -1.0
-
-def verify_node(node_url: str):
-    """节点验证任务流程"""
-    host, port = parse_host_port(node_url)
-    if not host or not port:
-        return None
-
-    rtt = ping_test(host, port)
-    if rtt > 0:
-        return (node_url, rtt)
-    return None
-
-# ==================== 5. 主控制流程 ====================
+# ==================== 主逻辑 ====================
 
 def main():
-    print("========================================")
-    print(" 开始运行多源 + Telegram 节点抓取任务")
-    print("========================================\n")
+    all_raw_nodes = []
 
-    raw_nodes = []
+    print("[+] 阶段 1: 正在拉取静态订阅源节点...")
+    for src in RAW_SOURCES:
+        nodes = fetch_from_sources(src)
+        all_raw_nodes.extend(nodes)
 
-    # 1. 抓取订阅源
-    print("[1/3] 正在拉取开源订阅源...")
-    for idx, url in enumerate(SOURCES, 1):
-        content = fetch_url(url)
-        nodes = extract_nodes_from_text(content)
-        print(f"  [订阅源 {idx}/{len(SOURCES)}] {url[:40]}... -> 提取到 {len(nodes)} 个节点")
-        raw_nodes.extend(nodes)
+    print("[+] 阶段 2: 正在爬取 Telegram 公开频道节点...")
+    tg_nodes = scrape_telegram_channels()
+    all_raw_nodes.extend(tg_nodes)
 
-    # 2. 抓取 Telegram 频道
-    print("\n[2/3] 正在拉取 Telegram 频道...")
-    for ch in TG_CHANNELS:
-        nodes = fetch_telegram_nodes(ch)
-        print(f"  [Telegram 频道] @{ch} -> 提取到 {len(nodes)} 个节点")
-        raw_nodes.extend(nodes)
+    # 规范化格式清理与筛选
+    valid_format_nodes = []
+    for n in all_raw_nodes:
+        n_clean = re.sub(r'<[^>]+>', '', n.strip()) # 剥离残留 HTML 标签
+        if re.match(PROTOCOL_PATTERN, n_clean):
+            valid_format_nodes.append(n_clean)
 
-    # 3. 去重与物理连通性检测
-    unique_nodes = list(set(raw_nodes))
-    total_found = len(unique_nodes)
-    print(f"\n[3/3] 汇聚去重后共有 {total_found} 个候选节点进入连通性检测...")
+    # 去重处理
+    unique_nodes = list(set(valid_format_nodes))
+    print(f"[+] 汇聚去重后共有 {len(unique_nodes)} 个节点")
 
-    valid_results = []
-    max_workers = 30
-    completed = 0
+    print("[+] 阶段 3: 正在精准深层解包并剔除目标伪造 SNI 节点...")
+    clean_nodes = []
+    blocked_count = 0
+    for node in unique_nodes:
+        if is_blacklisted_sni(node):
+            blocked_count += 1
+        else:
+            clean_nodes.append(node)
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
-        futures = {executor.submit(verify_node, node): node for node in unique_nodes}
-        for future in concurrent.futures.as_completed(futures):
-            res = future.result()
-            if res:
-                valid_results.append(res)
-            completed += 1
-            if completed % 100 == 0 or completed == total_found:
-                print(f"  检测进度: {completed}/{total_found} | 存活节点: {len(valid_results)}")
+    print(f"[+] 成功拦截并剔除指定黑名单伪节点: {blocked_count} 个")
+    print(f"[+] 最终保留优质节点总数: {len(clean_nodes)} 个")  
 
-    # 按响应延迟排序
-    valid_results.sort(key=lambda x: x[1])
-    top_nodes = [item[0] for item in valid_results[:100]]
+    # 生成并写入最终的 Base64 订阅文件
+    sub_content = "\n".join(clean_nodes)
+    encoded_sub = base64.b64encode(sub_content.encode('utf-8')).decode('utf-8')
 
-    print(f"\n检测完成！发现 {len(valid_results)} 个存活节点，精选前 {len(top_nodes)} 个写入订阅...")
-
-    # 输出 Base64 文件
-    sub_text = "\n".join(top_nodes)
-    encoded_sub = base64.b64encode(sub_text.encode('utf-8')).decode('utf-8')
-
+    # 兼容根目录与 public/ 目录（便于 GitHub Pages / Actions 部署）
     os.makedirs("public", exist_ok=True)
     with open("nekoray_sub.txt", "w", encoding="utf-8") as f:
         f.write(encoded_sub)
     with open("public/nekoray_sub.txt", "w", encoding="utf-8") as f:
         f.write(encoded_sub)
 
-    print("\n========================================")
-    print(" 订阅文件 nekoray_sub.txt 生成成功！")
-    print("========================================\n")
+    print("[+] 订阅文件 nekoray_sub.txt 更新成功！")
 
 if __name__ == "__main__":
     main()
