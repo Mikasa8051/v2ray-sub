@@ -1,15 +1,14 @@
 import base64
 import json
+import os
 import re
-import socket
-import ssl
-import concurrent.futures
+import subprocess
+import time
 import urllib.parse
 import urllib.request
 
 # ==================== 配置区 ====================
 
-# 1. 静态订阅源列表
 RAW_SOURCES = [
     "https://raw.githubusercontent.com/zhuhaiuk/free-nodes/main/nodes.txt",
     "https://raw.githubusercontent.com/mfuu/v2ray/master/v2ray",
@@ -19,7 +18,6 @@ RAW_SOURCES = [
     "https://raw.githubusercontent.com/ermaozi/get_free_proxy/main/sub"
 ]
 
-# 2. Telegram 公开频道列表
 TG_PUBLIC_CHANNELS = [
     "v2ray_free_conf",
     "Freev2rays",
@@ -27,7 +25,6 @@ TG_PUBLIC_CHANNELS = [
     "FreeV2RayConfig"
 ]
 
-# 3. 昨天的核心：精确拦截伪造 SNI / 垃圾域名黑名单
 BLOCKED_SNIS = [
     "u729792us3017.wagahaha.xyz",
     "www.ignitelimit.com",
@@ -36,17 +33,16 @@ BLOCKED_SNIS = [
     "example.com"
 ]
 
-# 4. 1ms 本地回环/假 IP 过滤名单
 INVALID_HOSTS = ["127.0.0.1", "0.0.0.0", "localhost"]
 
-# 5. 云端测速参数
-MAX_THREADS = 80         # 线程数
-CONNECT_TIMEOUT = 1.8    # 连通性超时（秒）
+# 真实测速参数
+TEST_URL = "https://speed.cloudflare.com/__down?bytes=5000000"  # 下载 5MB 测试文件测速
+DOWNLOAD_TIMEOUT = 4.0      # 单个节点测速超时时间（秒）
+MIN_SPEED_KBS = 200.0       # 最低保留网速阈值 (KB/s)，低于此速度直接剔除
+TOP_NODE_LIMIT = 200        # 最终精选保留的最大高速节点数
 
-# CDN 加速镜像前缀
+LOCAL_PROXY_PORT = 10808    # sing-box 本地代理端口
 MIRROR_PREFIX = "https://ghp.ci/"
-
-# 通用正则与请求头
 PROTOCOL_PATTERN = r"(?:vmess|vless|ss|trojan|socks5|hy2|hysteria2|tuic)://[a-zA-Z0-9%_\.\:\-\=\+\/\?\&\#\~\@\-\+]+"
 HEADERS = {
     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
@@ -55,7 +51,6 @@ HEADERS = {
 # ==================== 工具函数 ====================
 
 def safe_b64decode(s: str) -> str:
-    """安全的 Base64 解码函数"""
     s = s.strip()
     s = re.sub(r'[^a-zA-Z0-9+/=_-]', '', s)
     s = s.replace('-', '+').replace('_', '/')
@@ -68,7 +63,6 @@ def safe_b64decode(s: str) -> str:
         return ""
 
 def parse_clash_yaml(yaml_text: str) -> list:
-    """提取并转换 YAML/Clash 格式中的节点数据"""
     nodes = []
     proxy_blocks = re.findall(r"-\s*\{([^}]+)\}", yaml_text)
     if not proxy_blocks:
@@ -119,7 +113,6 @@ def parse_clash_yaml(yaml_text: str) -> list:
     return nodes
 
 def fetch_url_content(url: str) -> str:
-    """网络请求函数（支持自动回退至 CDN 镜像源）"""
     urls_to_try = [url]
     if "raw.githubusercontent.com" in url or "github.com" in url:
         urls_to_try.append(MIRROR_PREFIX + url)
@@ -127,7 +120,7 @@ def fetch_url_content(url: str) -> str:
     for target_url in urls_to_try:
         try:
             req = urllib.request.Request(target_url, headers=HEADERS)
-            with urllib.request.urlopen(req, timeout=12) as resp:
+            with urllib.request.urlopen(req, timeout=10) as resp:
                 content = resp.read().decode('utf-8', errors='ignore').strip()
                 if content:
                     return content
@@ -136,10 +129,8 @@ def fetch_url_content(url: str) -> str:
     return ""
 
 def fetch_from_sources(url: str) -> list:
-    """从静态源解析节点数据"""
     content = fetch_url_content(url)
     if not content:
-        print(f"[-] 抓取源失败 [{url}]")
         return []
 
     if "proxies:" in content or url.endswith((".yaml", ".yml")):
@@ -158,147 +149,199 @@ def fetch_from_sources(url: str) -> list:
     return curr.splitlines()
 
 def scrape_telegram_channels() -> list:
-    """从 Telegram 公开 Web 页面提取节点数据"""
     scraped_nodes = []
     for channel in TG_PUBLIC_CHANNELS:
         url = f"https://telegram.dog/s/{channel}"
-        print(f"[*] [TG爬虫] 正在爬取频道: @{channel}")
         html = fetch_url_content(url)
         if html:
             matches = re.findall(PROTOCOL_PATTERN, html)
             scraped_nodes.extend(matches)
-        else:
-            print(f"[-] 爬取 TG 频道 @{channel} 失败")
     return scraped_nodes
 
-def parse_node_info(node_str: str):
-    """提取 Host, Port, SNI 以及 TLS 标识"""
-    host, port, sni, use_tls = None, None, None, False
-    try:
-        if node_str.startswith("vmess://"):
-            b64_str = node_str[8:]
-            decoded = safe_b64decode(b64_str)
-            js = json.loads(decoded)
-            host = js.get("add")
-            port = int(js.get("port", 443))
-            sni = js.get("sni") or js.get("host") or host
-            use_tls = js.get("tls") == "tls"
-        elif any(node_str.startswith(p) for p in ["vless://", "trojan://", "hysteria2://", "hy2://", "ss://"]):
-            parsed = urllib.parse.urlparse(node_str)
-            host = parsed.hostname
-            port = parsed.port
-            
-            if not host and "@" in parsed.netloc:
-                netloc_part = parsed.netloc.split("@")[-1]
-                if ":" in netloc_part:
-                    host, port_str = netloc_part.split(":", 1)
-                    port = int(port_str.split("?")[0].split("#")[0])
-            
-            query = urllib.parse.parse_qs(parsed.query)
-            sni = query.get("sni", [host])[0]
-            use_tls = "tls" in query.get("security", [""])[0] or node_str.startswith(("trojan://", "hy2://"))
-    except Exception:
-        pass
-
-    return host, port, sni, use_tls
-
-def is_blacklisted(node_str: str, host: str) -> bool:
-    """第一重防线：黑名单 SNI 与 1ms 回环 IP 校验"""
+def is_blacklisted(node_str: str) -> bool:
     node_lower = node_str.lower()
     for blocked in BLOCKED_SNIS:
         if blocked.lower() in node_lower:
             return True
-    
-    if host and any(inv in host.lower() for inv in INVALID_HOSTS):
-        return True
-
+    for inv in INVALID_HOSTS:
+        if inv in node_lower:
+            return True
     return False
 
-def check_node_alive(node_str: str) -> str:
-    """第二重防线：云端智能 TLS/TCP 握手测试"""
-    host, port, sni, use_tls = parse_node_info(node_str)
+# ==================== sing-box 动态测速核心 ====================
 
-    if not host or not port:
-        return None
+def generate_singbox_config(outbound_json: dict) -> dict:
+    """生成包含本地 HTTP 入站和指定节点的 sing-box 配置"""
+    return {
+        "log": {"level": "warn"},
+        "inbounds": [
+            {
+                "type": "http",
+                "tag": "http-in",
+                "listen": "127.0.0.1",
+                "listen_port": LOCAL_PROXY_PORT
+            }
+        ],
+        "outbounds": [
+            outbound_json,
+            {"type": "direct", "tag": "direct"}
+        ]
+    }
 
-    if is_blacklisted(node_str, host):
-        return None
-
+def parse_singbox_outbound(node_str: str):
+    """把各种协议链接转换成 sing-box 的 outbound 配置结构"""
     try:
-        # TCP 三次握手
-        raw_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        raw_sock.settimeout(CONNECT_TIMEOUT)
-        
-        if use_tls:
-            # 带 TLS 握手的高级检测（防止错杀暗影节点）
-            context = ssl.create_default_context()
-            context.check_hostname = False
-            context.verify_mode = ssl.CERT_NONE
-            
-            with context.wrap_socket(raw_sock, server_hostname=sni or host) as ssl_sock:
-                ssl_sock.connect((host, port))
-                return node_str
-        else:
-            # 普通 TCP 校验
-            res = raw_sock.connect_ex((host, port))
-            raw_sock.close()
-            if res == 0:
-                return node_str
+        if node_str.startswith("vmess://"):
+            js = json.loads(safe_b64decode(node_str[8:]))
+            return {
+                "type": "vmess",
+                "tag": "proxy",
+                "server": js.get("add"),
+                "server_port": int(js.get("port", 443)),
+                "uuid": js.get("id"),
+                "security": "auto",
+                "tls": {"enabled": js.get("tls") == "tls", "insecure": True} if js.get("tls") == "tls" else {}
+            }
+        elif node_str.startswith("vless://"):
+            parsed = urllib.parse.urlparse(node_str)
+            query = urllib.parse.parse_qs(parsed.query)
+            uuid = parsed.username
+            return {
+                "type": "vless",
+                "tag": "proxy",
+                "server": parsed.hostname,
+                "server_port": parsed.port or 443,
+                "uuid": uuid,
+                "tls": {"enabled": True, "insecure": True} if "tls" in query.get("security", [""]) else {}
+            }
+        elif node_str.startswith("trojan://"):
+            parsed = urllib.parse.urlparse(node_str)
+            return {
+                "type": "trojan",
+                "tag": "proxy",
+                "server": parsed.hostname,
+                "server_port": parsed.port or 443,
+                "password": parsed.username,
+                "tls": {"enabled": True, "insecure": True}
+            }
+        elif node_str.startswith("ss://"):
+            parsed = urllib.parse.urlparse(node_str)
+            user_info = safe_b64decode(parsed.username) if parsed.username else ""
+            if ":" in user_info:
+                method, password = user_info.split(":", 1)
+                return {
+                    "type": "shadowsocks",
+                    "tag": "proxy",
+                    "server": parsed.hostname,
+                    "server_port": parsed.port,
+                    "method": method,
+                    "password": password
+                }
     except Exception:
         pass
-
     return None
+
+def measure_download_speed_via_proxy(node_str: str) -> float:
+    """启动 sing-box 进行实际流量下载测速，返回实际网速 (KB/s)"""
+    outbound = parse_singbox_outbound(node_str)
+    if not outbound:
+        return 0.0
+
+    config = generate_singbox_config(outbound)
+    config_file = "temp_config.json"
+    
+    with open(config_file, "w", encoding="utf-8") as f:
+        json.dump(config, f)
+
+    # 启动 sing-box 进程
+    proc = subprocess.Popen(["sing-box", "run", "-c", config_file], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    time.sleep(0.4)  # 等待内核完成绑定
+
+    speed_kbs = 0.0
+    proxy_handler = urllib.request.ProxyHandler({'http': f'http://127.0.0.1:{LOCAL_PROXY_PORT}', 'https': f'http://127.0.0.1:{LOCAL_PROXY_PORT}'})
+    opener = urllib.request.build_opener(proxy_handler)
+
+    try:
+        start_time = time.time()
+        req = urllib.request.Request(TEST_URL, headers={'User-Agent': 'Mozilla/5.0'})
+        with opener.open(req, timeout=DOWNLOAD_TIMEOUT) as response:
+            bytes_downloaded = 0
+            while True:
+                chunk = response.read(65536)
+                if not chunk:
+                    break
+                bytes_downloaded += len(chunk)
+                if time.time() - start_time > DOWNLOAD_TIMEOUT:
+                    break
+
+            duration = time.time() - start_time
+            if duration > 0 and bytes_downloaded > 0:
+                speed_kbs = (bytes_downloaded / 1024.0) / duration
+    except Exception:
+        speed_kbs = 0.0
+    finally:
+        proc.kill()
+        proc.wait()
+        if os.path.exists(config_file):
+            os.remove(config_file)
+
+    return speed_kbs
 
 # ==================== 主逻辑 ====================
 
 def main():
     all_raw_nodes = []
-
-    print("[+] 阶段 1: 正在拉取静态订阅源节点...")
+    print("[+] 正在拉取静态订阅源节点...")
     for src in RAW_SOURCES:
         nodes = fetch_from_sources(src)
         all_raw_nodes.extend(nodes)
 
-    print("[+] 阶段 2: 正在爬取 Telegram 公开频道节点...")
-    tg_nodes = scrape_telegram_channels()
-    all_raw_nodes.extend(tg_nodes)
+    print("[+] 正在爬取 Telegram 公开频道节点...")
+    all_raw_nodes.extend(scrape_telegram_channels())
 
-    # 规范化格式筛选
-    valid_format_nodes = []
-    for n in all_raw_nodes:
-        n_clean = n.strip()
-        if re.match(PROTOCOL_PATTERN, n_clean):
-            valid_format_nodes.append(n_clean)
-
-    # 去重处理
+    valid_format_nodes = [n.strip() for n in all_raw_nodes if re.match(PROTOCOL_PATTERN, n.strip()) and not is_blacklisted(n.strip())]
     unique_nodes = list(set(valid_format_nodes))
     total_count = len(unique_nodes)
-    print(f"[+] 汇聚去重后共有 {total_count} 个待测节点")
+    print(f"[+] 汇聚去重并过滤黑名单后共有 {total_count} 个待测节点")
 
-    print(f"[+] 阶段 3: 启动黑名单过滤 + {MAX_THREADS} 线程云端 TLS/TCP 握手测试...")
-    clean_nodes = []
+    print(f"[+] [方案 B] 正在调用 sing-box 进行【真实文件下载流量测速】...")
+    speed_results = []
+    
+    # 抽取前 600 个有效候选进行真实下载测速（兼顾 Actions 运行时间限制与效率）
+    candidate_nodes = unique_nodes[:600]
+    
+    for idx, node in enumerate(candidate_nodes, 1):
+        speed = measure_download_speed_via_proxy(node)
+        if speed >= MIN_SPEED_KBS:
+            speed_results.append((node, speed))
+            print(f"[{idx}/{len(candidate_nodes)}] 节点可真实连接 -> 速度: {speed:.1f} KB/s")
+        else:
+            if idx % 50 == 0:
+                print(f"[{idx}/{len(candidate_nodes)}] 测速推进中... (已找到 {len(speed_results)} 个高速节点)")
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_THREADS) as executor:
-        futures = {executor.submit(check_node_alive, node): node for node in unique_nodes}
-        
-        completed = 0
-        for future in concurrent.futures.as_completed(futures):
-            res = future.result()
-            if res:
-                clean_nodes.append(res)
-            completed += 1
-            if completed % 500 == 0 or completed == total_count:
-                print(f"[*] 测速进度: {completed}/{total_count} | 存活保留节点: {len(clean_nodes)}")
+    print(f"\n[+] 测速完成！共获取到 {len(speed_results)} 个高速节点（网速 >= {MIN_SPEED_KBS} KB/s）")
 
-    print(f"\n[+] 测速完成！全网收集: {total_count} 个 -> 精选存活: {len(clean_nodes)} 个")
+    # 按网速从大到小降序排列（最快的排在最前面）
+    speed_results.sort(key=lambda x: x[1], reverse=True)
 
-    # 生成 Base64 订阅文件
-    sub_content = "\n".join(clean_nodes)
+    # 截取网速前 200 名
+    top_nodes = speed_results[:TOP_NODE_LIMIT]
+    top_clean_nodes = [item[0] for item in top_nodes]
+
+    if top_nodes:
+        print(f"[+] 精选完成：已保留前 {len(top_clean_nodes)} 个最高速节点（最高速度: {top_nodes[0][1]/1024:.2f} MB/s）")
+
+    # 输出文件
+    sub_content = "\n".join(top_clean_nodes)
     encoded_sub = base64.b64encode(sub_content.encode('utf-8')).decode('utf-8')
 
+    os.makedirs("public", exist_ok=True)
     with open("nekoray_sub.txt", "w", encoding="utf-8") as f:
         f.write(encoded_sub)
-    print("[+] 订阅文件 nekoray_sub.txt 更新成功！")
+    with open("public/nekoray_sub.txt", "w", encoding="utf-8") as f:
+        f.write(encoded_sub)
+
+    print("[+] 订阅文件 nekoray_sub.txt 及 public/nekoray_sub.txt 更新成功！")
 
 if __name__ == "__main__":
     main()
