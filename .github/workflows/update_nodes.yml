@@ -2,9 +2,8 @@ name: Auto Update V2Ray Nodes
 
 on:
   schedule:
-    # 每 6 小时自动运行一次真实测速并更新
-    - cron: '0 */6 * * *'
-  workflow_dispatch: # 支持在 GitHub 控制台手动触发运行
+    - cron: '0 */6 * * *' # 每 6 小时自动测试并更新一次
+  workflow_dispatch: # 支持手动触发
 
 jobs:
   build:
@@ -19,18 +18,16 @@ jobs:
         with:
           python-version: '3.10'
 
-      - name: Install Dependencies & Install sing-box Engine
+      - name: Install Dependencies & Download sing-box
         run: |
           python -m pip install --upgrade pip
           
-          # 在 Ubuntu 环境上一键安装最新版 sing-box 引擎
-          sudo bash -c "$(curl -fsSL https://sing-box.app/gpg.key)"
-          sudo apt-get update
-          sudo apt-get install -y sing-box || {
-            # 备用安装渠道
-            curl -fsSL https://github.com/SagerNet/sing-box/releases/download/v1.8.10/sing-box-1.8.10-linux-amd64.tar.gz | tar -xz
-            sudo mv sing-box-*/sing-box /usr/local/bin/
-          }
+          # 直接下载官方 Release 静态可执行文件，避免镜像或参数解析报错
+          curl -sSL "https://github.com/SagerNet/sing-box/releases/download/v1.9.3/sing-box-1.9.3-linux-amd64.tar.gz" -o sing-box.tar.gz
+          tar -zxvf sing-box.tar.gz
+          sudo mv sing-box-1.9.3-linux-amd64/sing-box /usr/local/bin/
+          rm -rf sing-box.tar.gz sing-box-1.9.3-linux-amd64
+          
           sing-box version
 
       - name: Run Real Speedtest & Filter Nodes
@@ -47,5 +44,5 @@ jobs:
             git commit -m "Auto update high-speed nodes [$(date -u +'%Y-%m-%d %H:%M UTC')]"
             git push
           else
-            echo "节点文件未发生变化，跳过 Push。"
+            echo "节点无变化，无需提交。"
           fi
