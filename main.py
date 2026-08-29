@@ -39,7 +39,7 @@ INVALID_HOSTS = ["127.0.0.1", "0.0.0.0", "localhost"]
 TEST_URL = "https://speed.cloudflare.com/__down?bytes=5000000"  # 下载 5MB 测试文件测速
 DOWNLOAD_TIMEOUT = 4.0      # 单个节点测速超时时间（秒）
 MIN_SPEED_KBS = 200.0       # 最低保留网速阈值 (KB/s)，低于此速度直接剔除
-TOP_NODE_LIMIT = 200        # 最终精选保留的最大高速节点数
+TOP_NODE_LIMIT = 200        # 最终精选保留的最大高效节点数
 
 LOCAL_PROXY_PORT = 10808    # sing-box 本地代理端口
 MIRROR_PREFIX = "https://ghp.ci/"
@@ -171,7 +171,6 @@ def is_blacklisted(node_str: str) -> bool:
 # ==================== sing-box 动态测速核心 ====================
 
 def generate_singbox_config(outbound_json: dict) -> dict:
-    """生成包含本地 HTTP 入站和指定节点的 sing-box 配置"""
     return {
         "log": {"level": "warn"},
         "inbounds": [
@@ -189,7 +188,6 @@ def generate_singbox_config(outbound_json: dict) -> dict:
     }
 
 def parse_singbox_outbound(node_str: str):
-    """把各种协议链接转换成 sing-box 的 outbound 配置结构"""
     try:
         if node_str.startswith("vmess://"):
             js = json.loads(safe_b64decode(node_str[8:]))
@@ -242,26 +240,32 @@ def parse_singbox_outbound(node_str: str):
     return None
 
 def measure_download_speed_via_proxy(node_str: str) -> float:
-    """启动 sing-box 进行实际流量下载测速，返回实际网速 (KB/s)"""
     outbound = parse_singbox_outbound(node_str)
     if not outbound:
         return 0.0
 
     config = generate_singbox_config(outbound)
-    config_file = "temp_config.json"
+    config_file = f"temp_config_{os.getpid()}.json"
     
-    with open(config_file, "w", encoding="utf-8") as f:
-        json.dump(config, f)
-
-    # 启动 sing-box 进程
-    proc = subprocess.Popen(["sing-box", "run", "-c", config_file], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    time.sleep(0.4)  # 等待内核完成绑定
-
     speed_kbs = 0.0
-    proxy_handler = urllib.request.ProxyHandler({'http': f'http://127.0.0.1:{LOCAL_PROXY_PORT}', 'https': f'http://127.0.0.1:{LOCAL_PROXY_PORT}'})
-    opener = urllib.request.build_opener(proxy_handler)
-
+    proc = None
     try:
+        with open(config_file, "w", encoding="utf-8") as f:
+            json.dump(config, f)
+
+        proc = subprocess.Popen(
+            ["sing-box", "run", "-c", config_file], 
+            stdout=subprocess.DEVNULL, 
+            stderr=subprocess.DEVNULL
+        )
+        time.sleep(0.4)
+
+        proxy_handler = urllib.request.ProxyHandler({
+            'http': f'http://127.0.0.1:{LOCAL_PROXY_PORT}', 
+            'https': f'http://127.0.0.1:{LOCAL_PROXY_PORT}'
+        })
+        opener = urllib.request.build_opener(proxy_handler)
+
         start_time = time.time()
         req = urllib.request.Request(TEST_URL, headers={'User-Agent': 'Mozilla/5.0'})
         with opener.open(req, timeout=DOWNLOAD_TIMEOUT) as response:
@@ -280,10 +284,17 @@ def measure_download_speed_via_proxy(node_str: str) -> float:
     except Exception:
         speed_kbs = 0.0
     finally:
-        proc.kill()
-        proc.wait()
+        if proc:
+            try:
+                proc.kill()
+                proc.wait()
+            except Exception:
+                pass
         if os.path.exists(config_file):
-            os.remove(config_file)
+            try:
+                os.remove(config_file)
+            except Exception:
+                pass
 
     return speed_kbs
 
@@ -307,7 +318,6 @@ def main():
     print(f"[+] [方案 B] 正在调用 sing-box 进行【真实文件下载流量测速】...")
     speed_results = []
     
-    # 抽取前 600 个有效候选进行真实下载测速（兼顾 Actions 运行时间限制与效率）
     candidate_nodes = unique_nodes[:600]
     
     for idx, node in enumerate(candidate_nodes, 1):
@@ -321,7 +331,7 @@ def main():
 
     print(f"\n[+] 测速完成！共获取到 {len(speed_results)} 个高速节点（网速 >= {MIN_SPEED_KBS} KB/s）")
 
-    # 按网速从大到小降序排列（最快的排在最前面）
+    # 按网速从大到小降序排列
     speed_results.sort(key=lambda x: x[1], reverse=True)
 
     # 截取网速前 200 名
