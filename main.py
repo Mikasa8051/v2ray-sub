@@ -31,12 +31,11 @@ TG_PUBLIC_CHANNELS = [
     "FreeV2RayConfig"
 ]
 
+# GFW 精准阻断或垃圾 SNI 域名黑名单
 BLOCKED_SNIS = [
-    "u729792us3017.wagahaha.xyz",
-    "www.ignitelimit.com",
-    "www.cloudflare.com",
-    "cloudfront.net",
-    "example.com"
+    "wagahaha.xyz", "ignitelimit.com", "example.com",
+    "workers.dev", "pages.dev", "vercel.app",
+    "speedtest", "ipify", "herokuapp.com"
 ]
 
 INVALID_HOSTS = ["127.0.0.1", "0.0.0.0", "localhost"]
@@ -47,27 +46,11 @@ GFW_POLLUTED_IPS = {
     "46.82.174.68", "37.61.54.158", "93.46.8.89", "211.5.133.18"
 }
 
-
-# Cloudflare CDN IP 网段识别库 (已修复 CIDR 严格校验与官方标准网段)
-CF_IP_NETWORKS = [
-    ipaddress.ip_network(cidr, strict=False) for cidr in [
-        "173.245.48.0/20",
-        "103.21.244.0/22",
-        "103.22.200.0/22",
-        "103.31.4.0/22",
-        "141.101.64.0/18",
-        "108.162.192.0/18",
-        "190.93.240.0/20",
-        "188.114.96.0/20",
-        "197.234.240.0/22",
-        "198.41.128.0/17",
-        "162.158.0.0/15",
-        "104.16.0.0/13",
-        "104.24.0.0/14",
-        "172.67.0.0/16",
-        "131.0.72.0/22"
-    ]
-]
+# 现代内核支持的 SS 安全加密算法白名单
+ALLOWED_SS_CIPHERS = {
+    "aes-128-gcm", "aes-256-gcm", "chacha20-ietf-poly1305",
+    "2022-blake3-aes-128-gcm", "2022-blake3-aes-256-gcm"
+}
 
 MIRROR_PREFIX = "https://ghp.ci/"
 PROTOCOL_PATTERN = r"(?:vmess|vless|ss|trojan|socks5|hy2|hysteria2|tuic)://[a-zA-Z0-9%_\.\:\-\=\+\/\?\&\#\~\@\-\+]+"
@@ -76,18 +59,16 @@ HEADERS = {
 }
 
 MAX_WORKERS = 40           # 测试并发数
-TOP_NODE_LIMIT = 50        # 精选 50 个真实高质量节点
-HANDSHAKE_TIMEOUT = 1.0    # 握手超时时间控制在 1 秒内
+TOP_NODE_LIMIT = 80        # 精选 80 个物理有效优质节点
+HANDSHAKE_TIMEOUT = 0.8    # 握手超时时间控制在 0.8 秒内
 
-# ==================== 工具函数 ====================
+# ==================== 工具与数据清洗函数 ====================
 
-def is_cloudflare_ip(ip_str: str) -> bool:
-    """检测 IP 是否属于 Cloudflare CDN 网段"""
-    try:
-        ip_obj = ipaddress.ip_address(ip_str)
-        return any(ip_obj in net for net in CF_IP_NETWORKS)
-    except Exception:
-        return False
+def clean_node_string(node_str: str) -> str:
+    """清理节点链接中的 HTML 标签、多余空格和不可见字符"""
+    node_str = re.sub(r'<[^>]+>', '', node_str)  # 剥离所有 HTML 标签
+    node_str = node_str.strip().replace('\r', '').replace('\n', '')
+    return node_str
 
 def safe_b64decode(s: str) -> str:
     s = s.strip()
@@ -127,6 +108,8 @@ def parse_clash_yaml(yaml_text: str) -> list:
             if p_type == "ss":
                 cipher = kv.get("cipher", "")
                 password = kv.get("password", "")
+                if cipher.lower() not in ALLOWED_SS_CIPHERS:
+                    continue
                 userinfo = base64.b64encode(f"{cipher}:{password}".encode()).decode()
                 nodes.append(f"ss://{userinfo}@{server}:{port}#{name}")
             elif p_type in ("vmess", "vless"):
@@ -136,7 +119,9 @@ def parse_clash_yaml(yaml_text: str) -> list:
                         "v": "2", "ps": kv.get("name", "Node"), "add": server,
                         "port": port, "id": uuid, "aid": kv.get("alterId", "0"),
                         "net": kv.get("network", "tcp"), "type": "none",
-                        "tls": "tls" if kv.get("tls") == "true" else ""
+                        "tls": "tls" if kv.get("tls") == "true" else "",
+                        "host": kv.get("servername") or kv.get("ws-headers", {}).get("Host", ""),
+                        "path": kv.get("ws-path", "")
                     }
                     nodes.append(f"vmess://{base64.b64encode(json.dumps(v_json).encode()).decode()}")
                 else:
@@ -200,7 +185,7 @@ def scrape_telegram_channels() -> list:
 def is_blacklisted(node_str: str) -> bool:
     node_lower = node_str.lower()
     for blocked in BLOCKED_SNIS:
-        if blocked.lower() in node_lower:
+        if blocked in node_lower:
             return True
     for inv in INVALID_HOSTS:
         if inv in node_lower:
@@ -208,10 +193,11 @@ def is_blacklisted(node_str: str) -> bool:
     return False
 
 def extract_node_details(node_str: str):
-    """提取节点的地址、端口、TLS 状态及 SNI"""
+    """提取节点的地址、端口、TLS 状态、SNI 以及用于精确去重的凭据 (UUID/Path)"""
     try:
         is_tls = False
-        sni = None
+        sni = ""
+        credential = ""
 
         if node_str.startswith("vmess://"):
             js = json.loads(safe_b64decode(node_str[8:]))
@@ -219,21 +205,35 @@ def extract_node_details(node_str: str):
             port = int(js.get("port", 443))
             is_tls = js.get("tls") in ["tls", "1", True]
             sni = js.get("sni") or js.get("host") or host
-            return host, port, is_tls, sni
+            credential = f"{js.get('id', '')}:{js.get('path', '')}"
+            return host, port, is_tls, sni, credential
+            
         elif node_str.startswith("ss://"):
             clean_str = node_str[5:]
             if '#' in clean_str:
                 clean_str = clean_str.split('#')[0]
+            
             if '@' in clean_str:
-                server_part = clean_str.split('@')[1]
+                userinfo, server_part = clean_str.split('@', 1)
             else:
                 decoded = safe_b64decode(clean_str)
                 if '@' in decoded:
-                    server_part = decoded.split('@')[1]
+                    userinfo, server_part = decoded.split('@', 1)
                 else:
-                    return None, None, False, None
+                    return None, None, False, "", ""
+            
+            # SS 算法兼容性校验
+            try:
+                cipher_pass = safe_b64decode(userinfo) if not userinfo.count(':') else userinfo
+                cipher = cipher_pass.split(':')[0].lower()
+                if cipher not in ALLOWED_SS_CIPHERS:
+                    return None, None, False, "", ""
+            except Exception:
+                pass
+
             host, port = server_part.split(':')
-            return host, int(port), False, None
+            return host, int(port), False, "", userinfo
+            
         else:
             parsed = urllib.parse.urlparse(node_str)
             host = parsed.hostname
@@ -243,16 +243,18 @@ def extract_node_details(node_str: str):
             if node_str.startswith("trojan://") or node_str.startswith("hysteria2://") or node_str.startswith("hy2://"):
                 is_tls = True
             sni = query.get("sni", [host])[0]
-            return host, port, is_tls, sni
+            credential = parsed.username or parsed.path or ""
+            return host, port, is_tls, sni, credential
+            
     except Exception:
-        return None, None, False, None
+        return None, None, False, "", ""
 
-# ==================== 防污染 DNS 与 连通性复测探针 ====================
+# ==================== 防污染 DNS 与 连通性探针 ====================
 
 def query_doh_provider(doh_url: str, host: str) -> str:
     try:
         req = urllib.request.Request(f"{doh_url}?name={host}&type=1", headers=HEADERS)
-        with urllib.request.urlopen(req, timeout=1.5) as resp:
+        with urllib.request.urlopen(req, timeout=1.2) as resp:
             data = json.loads(resp.read().decode())
             if data.get("Status") == 0 and "Answer" in data:
                 for ans in data["Answer"]:
@@ -269,13 +271,21 @@ def check_china_doh_multi(host: str) -> str:
     ip = query_doh_provider("https://dns.alidns.com/resolve", host)
     if ip:
         return ip
-    return query_doh_provider("https://doh.pub/resolve", host)
+    ip = query_doh_provider("https://doh.pub/resolve", host)
+    if ip:
+        return ip
+    
+    # 备用：如 DoH 均被海外 Actions 限流，退回系统安全解析
+    try:
+        resolved = socket.gethostbyname(host)
+        if resolved not in GFW_POLLUTED_IPS:
+            return resolved
+    except Exception:
+        pass
+    return None
 
 def test_node_connectivity(ip: str, port: int, is_tls: bool, sni: str) -> float:
-    """
-    通过双重复测（Double-check）校验节点的物理 TCP/TLS 响应，
-    既不破坏代理协议，又能排查不稳定节点。
-    """
+    """双重复测 TCP / TLS 建连响应"""
     rtts = []
     for _ in range(2):
         start_time = time.time()
@@ -298,55 +308,58 @@ def test_node_connectivity(ip: str, port: int, is_tls: bool, sni: str) -> float:
             rtts.append(rtt)
         except Exception:
             return -1
-        time.sleep(0.05) # 短暂间隔后进行第二次复测
+        time.sleep(0.03)
 
     return sum(rtts) / len(rtts) if len(rtts) == 2 else -1
 
 def validate_and_score_node(node_str: str):
-    host, port, is_tls, sni = extract_node_details(node_str)
+    cleaned_node = clean_node_string(node_str)
+    host, port, is_tls, sni, credential = extract_node_details(cleaned_node)
     if not host or not port:
         return None
 
-    # 1. 国内 DoH 解析真实 IP
+    # 1. DoH 防污染解析
     resolved_ip = check_china_doh_multi(host)
     if not resolved_ip or resolved_ip in GFW_POLLUTED_IPS:
         return None
 
-    # 2. 识别 Cloudflare CDN 假套壳
-    is_cf = is_cloudflare_ip(resolved_ip)
-
-    # 3. 双重复测延迟探针
+    # 2. 建连测速
     rtt = test_node_connectivity(resolved_ip, port, is_tls, sni)
     if rtt <= 0:
         return None
 
-    # 物理底层 IP:Port 唯一标识
-    ip_port_key = f"{resolved_ip}:{port}"
-    return (node_str, rtt, ip_port_key, is_cf)
+    # 核心修补：联合维度去重 Key (IP + 端口 + SNI + 账号/路径)
+    # 彻底解决 Cloudflare 几千个节点因为 IP 相同被只保留 1 个的致命 BUG！
+    dedup_key = f"{resolved_ip}:{port}:{sni}:{credential}"
+    return (cleaned_node, rtt, dedup_key)
 
 # ==================== 主逻辑 ====================
 
 def main():
     all_raw_nodes = []
-    print("[+] 正在从高质量开源源拉取节点...")
+    print("[+] 正在拉取高质量开源源...")
     for src in RAW_SOURCES:
         nodes = fetch_from_sources(src)
         all_raw_nodes.extend(nodes)
 
-    print("[+] 正在爬取 Telegram 公开频道节点...")
+    print("[+] 正在爬取 Telegram 频道节点...")
     all_raw_nodes.extend(scrape_telegram_channels())
 
-    valid_format_nodes = [n.strip() for n in all_raw_nodes if re.match(PROTOCOL_PATTERN, n.strip()) and not is_blacklisted(n.strip())]
+    # 初步清理与黑名单过滤
+    valid_format_nodes = []
+    for n in all_raw_nodes:
+        cleaned = clean_node_string(n)
+        if re.match(PROTOCOL_PATTERN, cleaned) and not is_blacklisted(cleaned):
+            valid_format_nodes.append(cleaned)
     
     unique_nodes = list(set(valid_format_nodes))
     total_count = len(unique_nodes)
-    print(f"[+] 汇聚初步去重后共有 {total_count} 个待检测节点")
+    print(f"[+] 汇聚清洗后共有 {total_count} 个待检测候选节点")
 
-    print(f"[+] 启动 DoH 解析 + 物理 IP 硬去重 + CDN 智能识别 + 连通性复测 (线程数: {MAX_WORKERS})...")
+    print(f"[+] 启动 DoH 真实 IP 解析 + 联合维度去重 + 双重 TLS 握手测试 (线程数: {MAX_WORKERS})...")
     
-    direct_nodes = []  # 直连真实 VPS 节点（优先）
-    cf_nodes = []      # Cloudflare 套壳节点（备用/降权）
-    seen_ip_ports = set()
+    scored_nodes = []
+    seen_keys = set()
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
         future_to_node = {executor.submit(validate_and_score_node, node): node for node in unique_nodes}
@@ -354,33 +367,21 @@ def main():
         for future in concurrent.futures.as_completed(future_to_node):
             res = future.result()
             if res:
-                node_str, rtt, ip_port_key, is_cf = res
-                # 物理底层 IP:Port 硬去重
-                if ip_port_key not in seen_ip_ports:
-                    seen_ip_ports.add(ip_port_key)
-                    if is_cf:
-                        cf_nodes.append((node_str, rtt))
-                    else:
-                        direct_nodes.append((node_str, rtt))
+                node_str, rtt, dedup_key = res
+                if dedup_key not in seen_keys:
+                    seen_keys.add(dedup_key)
+                    scored_nodes.append((node_str, rtt))
             completed += 1
             if completed % 100 == 0 or completed == total_count:
-                print(f"[*] 进度: {completed}/{total_count} | 发现物理直连节点: {len(direct_nodes)} | CDN套壳节点: {len(cf_nodes)}")
+                print(f"[*] 进度: {completed}/{total_count} | 发现真正物理可用节点: {len(scored_nodes)}")
 
-    # 分别按响应延迟升序排列
-    direct_nodes.sort(key=lambda x: x[1])
-    cf_nodes.sort(key=lambda x: x[1])
+    # 按响应耗时升序排列
+    scored_nodes.sort(key=lambda x: x[1])
+    top_nodes = [item[0] for item in scored_nodes[:TOP_NODE_LIMIT]]
 
-    # 排序策略：优先填满直连 VPS 节点，直连不足时才用 CDN 节点补充，最多保留 5 个 CDN 节点
-    final_nodes_with_rtt = direct_nodes[:TOP_NODE_LIMIT]
-    if len(final_nodes_with_rtt) < TOP_NODE_LIMIT:
-        needed = TOP_NODE_LIMIT - len(final_nodes_with_rtt)
-        final_nodes_with_rtt.extend(cf_nodes[:min(needed, 5)])
+    print(f"\n[+] 筛选完成！从 {len(scored_nodes)} 个真正可建连的物理节点中，精选出 Top {len(top_nodes)} 个唯一优选节点。")
 
-    top_nodes = [item[0] for item in final_nodes_with_rtt]
-
-    print(f"\n[+] 筛选完成！成功精选出 Top {len(top_nodes)} 个物理独立且真可用的节点（直连 VPS 占比: {len(final_nodes_with_rtt) - min(len(cf_nodes), 5)}/{len(top_nodes)}）。")
-
-    # 输出 base64 订阅文件
+    # 输出 Base64 订阅文件
     sub_content = "\n".join(top_nodes)
     encoded_sub = base64.b64encode(sub_content.encode('utf-8')).decode('utf-8')
 
