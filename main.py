@@ -3,6 +3,8 @@ import json
 import os
 import re
 import socket
+import ssl
+import time
 import urllib.parse
 import urllib.request
 import concurrent.futures
@@ -48,8 +50,9 @@ HEADERS = {
     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
 }
 
-MAX_WORKERS = 30           # 增加并发线程数，缩短运行耗时
-TOP_NODE_LIMIT = 250        # 输出优选节点上限
+MAX_WORKERS = 30           # 线程数
+TOP_NODE_LIMIT = 150        # 精选输出前 150 个最高质量节点
+TLS_HANDSHAKE_TIMEOUT = 1.5 # TLS 握手超时限制（秒）
 
 # ==================== 工具函数 ====================
 
@@ -171,14 +174,20 @@ def is_blacklisted(node_str: str) -> bool:
             return True
     return False
 
-def extract_host_port(node_str: str):
-    """深度提取全协议节点的主机名/IP与端口"""
+def extract_node_details(node_str: str):
+    """深度提取节点信息，包含 SNI / TLS 状态"""
     try:
+        is_tls = False
+        sni = None
+
         if node_str.startswith("vmess://"):
             js = json.loads(safe_b64decode(node_str[8:]))
-            return js.get("add"), int(js.get("port", 443))
+            host = js.get("add")
+            port = int(js.get("port", 443))
+            is_tls = js.get("tls") in ["tls", "1", True]
+            sni = js.get("sni") or js.get("host") or host
+            return host, port, is_tls, sni
         elif node_str.startswith("ss://"):
-            # 兼容 SS URL 各种变体格式
             clean_str = node_str[5:]
             if '#' in clean_str:
                 clean_str = clean_str.split('#')[0]
@@ -189,22 +198,28 @@ def extract_host_port(node_str: str):
                 if '@' in decoded:
                     server_part = decoded.split('@')[1]
                 else:
-                    return None, None
+                    return None, None, False, None
             host, port = server_part.split(':')
-            return host, int(port)
+            return host, int(port), False, None
         else:
             parsed = urllib.parse.urlparse(node_str)
-            return parsed.hostname, parsed.port or 443
+            host = parsed.hostname
+            port = parsed.port or 443
+            query = urllib.parse.parse_qs(parsed.query)
+            is_tls = "security" in query and query["security"][0] in ["tls", "reality"]
+            if node_str.startswith("trojan://") or node_str.startswith("hysteria2://") or node_str.startswith("hy2://"):
+                is_tls = True
+            sni = query.get("sni", [host])[0]
+            return host, port, is_tls, sni
     except Exception:
-        return None, None
+        return None, None, False, None
 
-# ==================== 强化版：墙内连通性与污染探针 ====================
+# ==================== 核心：TLS 握手探针与响应测试 ====================
 
 def query_doh_provider(doh_url: str, host: str) -> str:
-    """查询单个 DoH 接口"""
     try:
         req = urllib.request.Request(f"{doh_url}?name={host}&type=1", headers=HEADERS)
-        with urllib.request.urlopen(req, timeout=2.5) as resp:
+        with urllib.request.urlopen(req, timeout=2.0) as resp:
             data = json.loads(resp.read().decode())
             if data.get("Status") == 0 and "Answer" in data:
                 for ans in data["Answer"]:
@@ -216,60 +231,56 @@ def query_doh_provider(doh_url: str, host: str) -> str:
     return None
 
 def check_china_doh_multi(host: str) -> str:
-    """双路国内 DoH (阿里 + 腾讯) 容错解析，精确判断墙内 DNS 污染"""
     if re.match(r"^\d+\.\d+\.\d+\.\d+$", host):
         return host
-
-    # 优先阿里 DoH
     ip = query_doh_provider("https://dns.alidns.com/resolve", host)
     if ip:
         return ip
+    return query_doh_provider("https://doh.pub/resolve", host)
 
-    # 备用腾讯 DNSPod DoH
-    ip = query_doh_provider("https://doh.pub/resolve", host)
-    if ip:
-        return ip
-
-    return None
-
-def check_cn_tcp_probe(ip: str, port: int) -> bool:
-    """结合国内 HTTP TCP 探针与原生 Socket 双重验证"""
-    # 探针 1：国内免费 TCP 连通性探针 API
-    try:
-        probe_url = f"https://api.ipify.org?format=json" # 保底存活验证
-    except Exception:
-        pass
-
-    # 探针 2：原生 Socket 快速握手 (超时 1.8 秒)
+def check_tls_and_latency(ip: str, port: int, is_tls: bool, sni: str):
+    """
+    针对 TLS 进行握手探针测试，测量真实响应 RTT。
+    如果 TLS 握手失败或耗时超过阈值，说明节点严重卡顿或配置失效，返回 -1。
+    """
+    start_time = time.time()
     try:
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        sock.settimeout(1.8)
+        sock.settimeout(TLS_HANDSHAKE_TIMEOUT)
         sock.connect((ip, port))
-        sock.close()
-        return True
+
+        if is_tls:
+            context = ssl.create_default_context()
+            context.check_hostname = False
+            context.verify_mode = ssl.CERT_NONE
+            ssl_sock = context.wrap_socket(sock, server_hostname=sni or ip)
+            ssl_sock.do_handshake()
+            ssl_sock.close()
+        else:
+            sock.close()
+
+        rtt = (time.time() - start_time) * 1000
+        return rtt
     except Exception:
-        return False
+        return -1
 
-def validate_node_for_china(node_str: str) -> bool:
-    """三步法防误杀校验：域名解析 -> 防 DNS 污染 -> 墙内端口存活"""
-    host, port = extract_host_port(node_str)
+def validate_and_score_node(node_str: str):
+    """综合评估：域名解析 -> 防 DNS 污染 -> TLS/TCP 握手探针 -> 延迟打分"""
+    host, port, is_tls, sni = extract_node_details(node_str)
     if not host or not port:
-        return False
+        return None
 
-    # 1. 国内双 DoH 防污染校验
+    # 1. 国内双 DoH 解析防污染
     resolved_ip = check_china_doh_multi(host)
-    if not resolved_ip:
-        return False  # 被墙内 DNS 污染或无法解析的死域名
+    if not resolved_ip or resolved_ip in GFW_POLLUTED_IPS:
+        return None
 
-    # 2. 已知 GFW 黑名单/污染 IP 网段拦截
-    if resolved_ip in GFW_POLLUTED_IPS:
-        return False
+    # 2. 执行 TLS / TCP 响应探针测试
+    rtt = check_tls_and_latency(resolved_ip, port, is_tls, sni)
+    if rtt <= 0:
+        return None  # 握手失败或响应超时（>1.5s）的弱节点
 
-    # 3. 基础端口通畅性探测
-    if not check_cn_tcp_probe(resolved_ip, port):
-        return False
-
-    return True
+    return (node_str, rtt)
 
 # ==================== 主逻辑 ====================
 
@@ -283,32 +294,30 @@ def main():
     print("[+] 正在爬取 Telegram 公开频道节点...")
     all_raw_nodes.extend(scrape_telegram_channels())
 
-    # 协议匹配与初步过滤
     valid_format_nodes = [n.strip() for n in all_raw_nodes if re.match(PROTOCOL_PATTERN, n.strip()) and not is_blacklisted(n.strip())]
     unique_nodes = list(set(valid_format_nodes))
     total_count = len(unique_nodes)
     print(f"[+] 汇聚去重后共有 {total_count} 个待检测节点")
 
-    print(f"[+] 启动国内双 DoH 防污染 + 端口连通性深度检测 (线程数: {MAX_WORKERS})...")
-    valid_nodes = []
+    print(f"[+] 启动 DoH 防污染 + TLS 协议握手探针过滤 (线程数: {MAX_WORKERS})...")
+    scored_nodes = []
     
     with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-        future_to_node = {executor.submit(validate_node_for_china, node): node for node in unique_nodes}
+        future_to_node = {executor.submit(validate_and_score_node, node): node for node in unique_nodes}
         completed = 0
         for future in concurrent.futures.as_completed(future_to_node):
-            node = future_to_node[future]
-            try:
-                if future.result():
-                    valid_nodes.append(node)
-            except Exception:
-                pass
+            res = future.result()
+            if res:
+                scored_nodes.append(res)
             completed += 1
             if completed % 100 == 0 or completed == total_count:
-                print(f"[*] 进度: {completed}/{total_count} | 墙内精选可用节点: {len(valid_nodes)}")
+                print(f"[*] 进度: {completed}/{total_count} | 墙内响应良好节点: {len(scored_nodes)}")
 
-    print(f"\n[+] 检测完成！成功精选出 {len(valid_nodes)} 个适合国内直连的节点。")
+    # 按照握手响应耗时排序 (RTT 从小到大，优先保存响应最灵敏的节点)
+    scored_nodes.sort(key=lambda x: x[1])
+    top_nodes = [item[0] for item in scored_nodes[:TOP_NODE_LIMIT]]
 
-    top_nodes = valid_nodes[:TOP_NODE_LIMIT]
+    print(f"\n[+] 筛选完成！已从 {len(scored_nodes)} 个合格节点中精选出响应最快的 Top {len(top_nodes)} 个节点。")
 
     # 输出 base64 订阅文件
     sub_content = "\n".join(top_nodes)
