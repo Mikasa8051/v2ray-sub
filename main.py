@@ -8,16 +8,20 @@ import time
 import urllib.parse
 import urllib.request
 import concurrent.futures
+import ipaddress
 
 # ==================== 配置区 ====================
 
+# 高频更新高质量源列表
 RAW_SOURCES = [
-    "https://raw.githubusercontent.com/zhuhaiuk/free-nodes/main/nodes.txt",
+    "https://raw.githubusercontent.com/pawdroid/Free-servers/main/sub",
+    "https://raw.githubusercontent.com/ermaozi/get_subscribe/main/subscribe/v2ray.txt",
     "https://raw.githubusercontent.com/mfuu/v2ray/master/v2ray",
-    "https://raw.githubusercontent.com/Au1rxx/free-vpn-subscriptions/main/output/v2ray-base64.txt",
-    "https://raw.githubusercontent.com/free18/v2ray/refs/heads/main/c.yaml",
-    "https://raw.githubusercontent.com/freefq/free/master/v2",
-    "https://raw.githubusercontent.com/ermaozi/get_free_proxy/main/sub"
+    "https://raw.githubusercontent.com/SoliSpirit/v2ray-configs/main/Protocols/vless.txt",
+    "https://fastly.jsdelivr.net/gh/ALIILAPRO/v2rayng-config@master/sub.txt",
+    "https://raw.githubusercontent.com/peasoft/NoMoreWalls/master/list.txt",
+    "https://raw.githubusercontent.com/roosterkid/openproxylist/main/V2RAY_RAW.txt",
+    "https://raw.githubusercontent.com/freefq/free/master/v2"
 ]
 
 TG_PUBLIC_CHANNELS = [
@@ -43,17 +47,35 @@ GFW_POLLUTED_IPS = {
     "46.82.174.68", "37.61.54.158", "93.46.8.89", "211.5.133.18"
 }
 
+# Cloudflare CDN IP 网段识别库 (用于识别假套壳节点)
+CF_IP_NETWORKS = [
+    ipaddress.ip_network(cidr) for cidr in [
+        "104.16.0.0/12", "172.67.0.0/16", "162.159.0.0/15", "104.28.0.0/14",
+        "198.41.128.0/17", "173.245.48.0/20", "103.21.244.0/22", "103.22.200.0/22",
+        "103.31.4.0/22", "141.101.64.0/18", "108.162.192.0/18", "190.93.240.0/20",
+        "188.114.96.0/20", "197.234.240.0/22"
+    ]
+]
+
 MIRROR_PREFIX = "https://ghp.ci/"
 PROTOCOL_PATTERN = r"(?:vmess|vless|ss|trojan|socks5|hy2|hysteria2|tuic)://[a-zA-Z0-9%_\.\:\-\=\+\/\?\&\#\~\@\-\+]+"
 HEADERS = {
     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
 }
 
-MAX_WORKERS = 40           # 适当加大并发
-TOP_NODE_LIMIT = 100        # 精选 Top 100 优质节点
-TLS_HANDSHAKE_TIMEOUT = 0.8 # 严格控制握手超时为 0.8 秒以内
+MAX_WORKERS = 40           # 测试并发数
+TOP_NODE_LIMIT = 50        # 精选 50 个真实高质量节点
+HANDSHAKE_TIMEOUT = 1.0    # 握手超时时间控制在 1 秒内
 
 # ==================== 工具函数 ====================
+
+def is_cloudflare_ip(ip_str: str) -> bool:
+    """检测 IP 是否属于 Cloudflare CDN 网段"""
+    try:
+        ip_obj = ipaddress.ip_address(ip_str)
+        return any(ip_obj in net for net in CF_IP_NETWORKS)
+    except Exception:
+        return False
 
 def safe_b64decode(s: str) -> str:
     s = s.strip()
@@ -213,7 +235,7 @@ def extract_node_details(node_str: str):
     except Exception:
         return None, None, False, None
 
-# ==================== 防污染 DNS 与 TLS 握手 ====================
+# ==================== 防污染 DNS 与 连通性复测探针 ====================
 
 def query_doh_provider(doh_url: str, host: str) -> str:
     try:
@@ -237,50 +259,64 @@ def check_china_doh_multi(host: str) -> str:
         return ip
     return query_doh_provider("https://doh.pub/resolve", host)
 
-def check_tls_and_latency(ip: str, port: int, is_tls: bool, sni: str):
-    start_time = time.time()
-    try:
-        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        sock.settimeout(TLS_HANDSHAKE_TIMEOUT)
-        sock.connect((ip, port))
+def test_node_connectivity(ip: str, port: int, is_tls: bool, sni: str) -> float:
+    """
+    通过双重复测（Double-check）校验节点的物理 TCP/TLS 响应，
+    既不破坏代理协议，又能排查不稳定节点。
+    """
+    rtts = []
+    for _ in range(2):
+        start_time = time.time()
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.settimeout(HANDSHAKE_TIMEOUT)
+            sock.connect((ip, port))
 
-        if is_tls:
-            context = ssl.create_default_context()
-            context.check_hostname = False
-            context.verify_mode = ssl.CERT_NONE
-            ssl_sock = context.wrap_socket(sock, server_hostname=sni or ip)
-            ssl_sock.do_handshake()
-            ssl_sock.close()
-        else:
-            sock.close()
+            if is_tls:
+                context = ssl.create_default_context()
+                context.check_hostname = False
+                context.verify_mode = ssl.CERT_NONE
+                ssl_sock = context.wrap_socket(sock, server_hostname=sni or ip)
+                ssl_sock.do_handshake()
+                ssl_sock.close()
+            else:
+                sock.close()
 
-        rtt = (time.time() - start_time) * 1000
-        return rtt
-    except Exception:
-        return -1
+            rtt = (time.time() - start_time) * 1000
+            rtts.append(rtt)
+        except Exception:
+            return -1
+        time.sleep(0.05) # 短暂间隔后进行第二次复测
+
+    return sum(rtts) / len(rtts) if len(rtts) == 2 else -1
 
 def validate_and_score_node(node_str: str):
     host, port, is_tls, sni = extract_node_details(node_str)
     if not host or not port:
         return None
 
+    # 1. 国内 DoH 解析真实 IP
     resolved_ip = check_china_doh_multi(host)
     if not resolved_ip or resolved_ip in GFW_POLLUTED_IPS:
         return None
 
-    rtt = check_tls_and_latency(resolved_ip, port, is_tls, sni)
+    # 2. 识别 Cloudflare CDN 假套壳
+    is_cf = is_cloudflare_ip(resolved_ip)
+
+    # 3. 双重复测延迟探针
+    rtt = test_node_connectivity(resolved_ip, port, is_tls, sni)
     if rtt <= 0:
         return None
 
-    # 返回底层真实 IP:Port 标识，便于物理去重
+    # 物理底层 IP:Port 唯一标识
     ip_port_key = f"{resolved_ip}:{port}"
-    return (node_str, rtt, ip_port_key)
+    return (node_str, rtt, ip_port_key, is_cf)
 
 # ==================== 主逻辑 ====================
 
 def main():
     all_raw_nodes = []
-    print("[+] 正在拉取静态订阅源节点...")
+    print("[+] 正在从高质量开源源拉取节点...")
     for src in RAW_SOURCES:
         nodes = fetch_from_sources(src)
         all_raw_nodes.extend(nodes)
@@ -290,15 +326,15 @@ def main():
 
     valid_format_nodes = [n.strip() for n in all_raw_nodes if re.match(PROTOCOL_PATTERN, n.strip()) and not is_blacklisted(n.strip())]
     
-    # 初步字符级去重
     unique_nodes = list(set(valid_format_nodes))
     total_count = len(unique_nodes)
     print(f"[+] 汇聚初步去重后共有 {total_count} 个待检测节点")
 
-    print(f"[+] 启动 DoH 真实 IP 防污染 + 物理套壳去重 + TLS 握手测试 (线程数: {MAX_WORKERS})...")
+    print(f"[+] 启动 DoH 解析 + 物理 IP 硬去重 + CDN 智能识别 + 连通性复测 (线程数: {MAX_WORKERS})...")
     
-    scored_nodes = []
-    seen_ip_ports = set()  # 核心：用于物理 IP:Port 级硬去重 Set
+    direct_nodes = []  # 直连真实 VPS 节点（优先）
+    cf_nodes = []      # Cloudflare 套壳节点（备用/降权）
+    seen_ip_ports = set()
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
         future_to_node = {executor.submit(validate_and_score_node, node): node for node in unique_nodes}
@@ -306,20 +342,31 @@ def main():
         for future in concurrent.futures.as_completed(future_to_node):
             res = future.result()
             if res:
-                node_str, rtt, ip_port_key = res
-                # 核心硬去重：如果这个 IP:Port 已经存在，不管它换了什么套壳域名，一律丢弃！
+                node_str, rtt, ip_port_key, is_cf = res
+                # 物理底层 IP:Port 硬去重
                 if ip_port_key not in seen_ip_ports:
                     seen_ip_ports.add(ip_port_key)
-                    scored_nodes.append((node_str, rtt))
+                    if is_cf:
+                        cf_nodes.append((node_str, rtt))
+                    else:
+                        direct_nodes.append((node_str, rtt))
             completed += 1
             if completed % 100 == 0 or completed == total_count:
-                print(f"[*] 进度: {completed}/{total_count} | 物理独立可用节点: {len(scored_nodes)}")
+                print(f"[*] 进度: {completed}/{total_count} | 发现物理直连节点: {len(direct_nodes)} | CDN套壳节点: {len(cf_nodes)}")
 
-    # 按 TLS / TCP 响应耗时升序排列
-    scored_nodes.sort(key=lambda x: x[1])
-    top_nodes = [item[0] for item in scored_nodes[:TOP_NODE_LIMIT]]
+    # 分别按响应延迟升序排列
+    direct_nodes.sort(key=lambda x: x[1])
+    cf_nodes.sort(key=lambda x: x[1])
 
-    print(f"\n[+] 筛选完成！从 {len(scored_nodes)} 个物理独立节点中，精选出响应最快的 Top {len(top_nodes)} 个唯一节点。")
+    # 排序策略：优先填满直连 VPS 节点，直连不足时才用 CDN 节点补充，最多保留 5 个 CDN 节点
+    final_nodes_with_rtt = direct_nodes[:TOP_NODE_LIMIT]
+    if len(final_nodes_with_rtt) < TOP_NODE_LIMIT:
+        needed = TOP_NODE_LIMIT - len(final_nodes_with_rtt)
+        final_nodes_with_rtt.extend(cf_nodes[:min(needed, 5)])
+
+    top_nodes = [item[0] for item in final_nodes_with_rtt]
+
+    print(f"\n[+] 筛选完成！成功精选出 Top {len(top_nodes)} 个物理独立且真可用的节点（直连 VPS 占比: {len(final_nodes_with_rtt) - min(len(cf_nodes), 5)}/{len(top_nodes)}）。")
 
     # 输出 base64 订阅文件
     sub_content = "\n".join(top_nodes)
