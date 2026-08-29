@@ -8,12 +8,12 @@ import time
 import urllib.parse
 import urllib.request
 import concurrent.futures
-import ipaddress
 
-# ==================== 配置区 ====================
+# ==================== 1. 配置区 ====================
 
-# 高频更新高质量源列表
+# 汇总所有历史与最新的高频更新源列表（已去重）
 RAW_SOURCES = [
+    "https://raw.githubusercontent.com/freefq/free/master/v2",
     "https://raw.githubusercontent.com/pawdroid/Free-servers/main/sub",
     "https://raw.githubusercontent.com/ermaozi/get_subscribe/main/subscribe/v2ray.txt",
     "https://raw.githubusercontent.com/mfuu/v2ray/master/v2ray",
@@ -21,9 +21,14 @@ RAW_SOURCES = [
     "https://fastly.jsdelivr.net/gh/ALIILAPRO/v2rayng-config@master/sub.txt",
     "https://raw.githubusercontent.com/peasoft/NoMoreWalls/master/list.txt",
     "https://raw.githubusercontent.com/roosterkid/openproxylist/main/V2RAY_RAW.txt",
-    "https://raw.githubusercontent.com/freefq/free/master/v2"
+    "https://raw.githubusercontent.com/w2ray/v2ray/main/v2ray",
+    "https://raw.githubusercontent.com/fsub/v2ray/main/sub",
+    "https://raw.githubusercontent.com/Emerge-Nodes/Emerge-Nodes/main/sub",
+    "https://raw.githubusercontent.com/vless-node/vless-node/main/vless.txt",
+    "https://raw.githubusercontent.com/mftzgv/Free-Node-Merge/main/out/nodes.txt"
 ]
 
+# Telegram 公开抓取频道
 TG_PUBLIC_CHANNELS = [
     "v2ray_free_conf",
     "Freev2rays",
@@ -31,7 +36,7 @@ TG_PUBLIC_CHANNELS = [
     "FreeV2RayConfig"
 ]
 
-# GFW 精准阻断或垃圾 SNI 域名黑名单
+# GFW 精准阻断 SNI 域名与非法主机名黑名单
 BLOCKED_SNIS = [
     "wagahaha.xyz", "ignitelimit.com", "example.com",
     "workers.dev", "pages.dev", "vercel.app",
@@ -40,13 +45,15 @@ BLOCKED_SNIS = [
 
 INVALID_HOSTS = ["127.0.0.1", "0.0.0.0", "localhost"]
 
+# GFW 常见污染固定投毒 IP
 GFW_POLLUTED_IPS = {
     "0.0.0.0", "127.0.0.1", "10.10.10.10", "1.1.1.1", "8.8.8.8",
     "59.24.3.173", "203.98.7.65", "243.185.187.39", "78.16.49.15",
-    "46.82.174.68", "37.61.54.158", "93.46.8.89", "211.5.133.18"
+    "46.82.174.68", "37.61.54.158", "93.46.8.89", "211.5.133.18",
+    "159.106.121.75", "203.98.7.66", "243.185.187.30"
 }
 
-# 现代内核支持的 SS 安全加密算法白名单
+# 现代内核 (Xray / sing-box) 支持的安全 SS 加密算法
 ALLOWED_SS_CIPHERS = {
     "aes-128-gcm", "aes-256-gcm", "chacha20-ietf-poly1305",
     "2022-blake3-aes-128-gcm", "2022-blake3-aes-256-gcm"
@@ -55,18 +62,18 @@ ALLOWED_SS_CIPHERS = {
 MIRROR_PREFIX = "https://ghp.ci/"
 PROTOCOL_PATTERN = r"(?:vmess|vless|ss|trojan|socks5|hy2|hysteria2|tuic)://[a-zA-Z0-9%_\.\:\-\=\+\/\?\&\#\~\@\-\+]+"
 HEADERS = {
-    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36'
 }
 
-MAX_WORKERS = 40           # 测试并发数
-TOP_NODE_LIMIT = 80        # 精选 80 个物理有效优质节点
-HANDSHAKE_TIMEOUT = 0.8    # 握手超时时间控制在 0.8 秒内
+MAX_WORKERS = 40           # 并发测试线程数
+TOP_NODE_LIMIT = 80        # 精选优质节点输出数量
+HANDSHAKE_TIMEOUT = 1.0    # 单次握手超时上限 (秒)
 
-# ==================== 工具与数据清洗函数 ====================
+# ==================== 2. 工具与清洗函数 ====================
 
 def clean_node_string(node_str: str) -> str:
-    """清理节点链接中的 HTML 标签、多余空格和不可见字符"""
-    node_str = re.sub(r'<[^>]+>', '', node_str)  # 剥离所有 HTML 标签
+    """清理节点链接中的 HTML 标签、多余空格和控制字符"""
+    node_str = re.sub(r'<[^>]+>', '', node_str)
     node_str = node_str.strip().replace('\r', '').replace('\n', '')
     return node_str
 
@@ -83,6 +90,7 @@ def safe_b64decode(s: str) -> str:
         return ""
 
 def parse_clash_yaml(yaml_text: str) -> list:
+    """解析 Clash YAML 格式的订阅并转化为标准链接"""
     nodes = []
     proxy_blocks = re.findall(r"-\s*\{([^}]+)\}", yaml_text)
     if not proxy_blocks:
@@ -137,6 +145,7 @@ def parse_clash_yaml(yaml_text: str) -> list:
     return nodes
 
 def fetch_url_content(url: str) -> str:
+    """带镜像降级的通用 HTTP 请求"""
     urls_to_try = [url]
     if "raw.githubusercontent.com" in url or "github.com" in url:
         urls_to_try.append(MIRROR_PREFIX + url)
@@ -155,13 +164,22 @@ def fetch_url_content(url: str) -> str:
 def fetch_from_sources(url: str) -> list:
     content = fetch_url_content(url)
     if not content:
+        print(f"  [x] 请求失败/被阻断: {url}")
         return []
 
+    # 过滤反爬虫 HTML 报错页
+    if "<html" in content.lower() or "<doctype" in content.lower():
+        print(f"  [x] 返回了非节点 HTML 页面: {url}")
+        return []
+
+    # 解析 Clash YAML
     if "proxies:" in content or url.endswith((".yaml", ".yml")):
         yaml_nodes = parse_clash_yaml(content)
         if yaml_nodes:
+            print(f"  [√] Clash 源成功提取 {len(yaml_nodes)} 个节点: {url}")
             return yaml_nodes
 
+    # 多层 Base64 解码
     curr = content
     for _ in range(3):
         decoded = safe_b64decode(curr)
@@ -170,7 +188,9 @@ def fetch_from_sources(url: str) -> list:
         else:
             break
     
-    return curr.splitlines()
+    nodes = [line.strip() for line in curr.splitlines() if line.strip()]
+    print(f"  [√] 成功提取 {len(nodes)} 个节点: {url}")
+    return nodes
 
 def scrape_telegram_channels() -> list:
     scraped_nodes = []
@@ -180,6 +200,7 @@ def scrape_telegram_channels() -> list:
         if html:
             matches = re.findall(PROTOCOL_PATTERN, html)
             scraped_nodes.extend(matches)
+    print(f"  [√] Telegram 频道共爬取到 {len(scraped_nodes)} 个节点")
     return scraped_nodes
 
 def is_blacklisted(node_str: str) -> bool:
@@ -193,7 +214,7 @@ def is_blacklisted(node_str: str) -> bool:
     return False
 
 def extract_node_details(node_str: str):
-    """提取节点的地址、端口、TLS 状态、SNI 以及用于精确去重的凭据 (UUID/Path)"""
+    """提取节点的Host、端口、TLS状态、SNI及联合去重凭据"""
     try:
         is_tls = False
         sni = ""
@@ -222,7 +243,7 @@ def extract_node_details(node_str: str):
                 else:
                     return None, None, False, "", ""
             
-            # SS 算法兼容性校验
+            # SS 校验算法安全性
             try:
                 cipher_pass = safe_b64decode(userinfo) if not userinfo.count(':') else userinfo
                 cipher = cipher_pass.split(':')[0].lower()
@@ -249,7 +270,7 @@ def extract_node_details(node_str: str):
     except Exception:
         return None, None, False, "", ""
 
-# ==================== 防污染 DNS 与 连通性探针 ====================
+# ==================== 3. DNS 与物理建连测试 ====================
 
 def query_doh_provider(doh_url: str, host: str) -> str:
     try:
@@ -268,6 +289,8 @@ def query_doh_provider(doh_url: str, host: str) -> str:
 def check_china_doh_multi(host: str) -> str:
     if re.match(r"^\d+\.\d+\.\d+\.\d+$", host):
         return host
+
+    # 多路 DoH 校验
     ip = query_doh_provider("https://dns.alidns.com/resolve", host)
     if ip:
         return ip
@@ -275,7 +298,7 @@ def check_china_doh_multi(host: str) -> str:
     if ip:
         return ip
     
-    # 备用：如 DoH 均被海外 Actions 限流，退回系统安全解析
+    # DoH 被 Actions 限流时退回系统解析
     try:
         resolved = socket.gethostbyname(host)
         if resolved not in GFW_POLLUTED_IPS:
@@ -285,7 +308,7 @@ def check_china_doh_multi(host: str) -> str:
     return None
 
 def test_node_connectivity(ip: str, port: int, is_tls: bool, sni: str) -> float:
-    """双重复测 TCP / TLS 建连响应"""
+    """真实 TCP/TLS 握手延时探针 (双测试取均值)"""
     rtts = []
     for _ in range(2):
         start_time = time.time()
@@ -308,7 +331,7 @@ def test_node_connectivity(ip: str, port: int, is_tls: bool, sni: str) -> float:
             rtts.append(rtt)
         except Exception:
             return -1
-        time.sleep(0.03)
+        time.sleep(0.02)
 
     return sum(rtts) / len(rtts) if len(rtts) == 2 else -1
 
@@ -323,29 +346,28 @@ def validate_and_score_node(node_str: str):
     if not resolved_ip or resolved_ip in GFW_POLLUTED_IPS:
         return None
 
-    # 2. 建连测速
+    # 2. 真实建连测速
     rtt = test_node_connectivity(resolved_ip, port, is_tls, sni)
     if rtt <= 0:
         return None
 
-    # 核心修补：联合维度去重 Key (IP + 端口 + SNI + 账号/路径)
-    # 彻底解决 Cloudflare 几千个节点因为 IP 相同被只保留 1 个的致命 BUG！
+    # 3. 联合维度 Key 去重 (IP + 端口 + SNI + 账号凭据/Path)
     dedup_key = f"{resolved_ip}:{port}:{sni}:{credential}"
     return (cleaned_node, rtt, dedup_key)
 
-# ==================== 主逻辑 ====================
+# ==================== 4. 主程序入口 ====================
 
 def main():
     all_raw_nodes = []
-    print("[+] 正在拉取高质量开源源...")
+    print("[+] 开始拉取全量开源订阅源...")
     for src in RAW_SOURCES:
         nodes = fetch_from_sources(src)
         all_raw_nodes.extend(nodes)
 
-    print("[+] 正在爬取 Telegram 频道节点...")
+    print("[+] 开始抓取 Telegram 频道...")
     all_raw_nodes.extend(scrape_telegram_channels())
 
-    # 初步清理与黑名单过滤
+    # 基础清洗与黑名单剥离
     valid_format_nodes = []
     for n in all_raw_nodes:
         cleaned = clean_node_string(n)
@@ -354,9 +376,9 @@ def main():
     
     unique_nodes = list(set(valid_format_nodes))
     total_count = len(unique_nodes)
-    print(f"[+] 汇聚清洗后共有 {total_count} 个待检测候选节点")
+    print(f"\n[+] 汇聚去重后共有 {total_count} 个候选节点进入深度测试流程")
 
-    print(f"[+] 启动 DoH 真实 IP 解析 + 联合维度去重 + 双重 TLS 握手测试 (线程数: {MAX_WORKERS})...")
+    print(f"[+] 启动物理连通性探针 (并发线程数: {MAX_WORKERS})...")
     
     scored_nodes = []
     seen_keys = set()
@@ -373,15 +395,15 @@ def main():
                     scored_nodes.append((node_str, rtt))
             completed += 1
             if completed % 100 == 0 or completed == total_count:
-                print(f"[*] 进度: {completed}/{total_count} | 发现真正物理可用节点: {len(scored_nodes)}")
+                print(f"[*] 扫描进度: {completed}/{total_count} | 当前有效节点: {len(scored_nodes)}")
 
-    # 按响应耗时升序排列
+    # 按物理握手响应延迟升序排序
     scored_nodes.sort(key=lambda x: x[1])
     top_nodes = [item[0] for item in scored_nodes[:TOP_NODE_LIMIT]]
 
-    print(f"\n[+] 筛选完成！从 {len(scored_nodes)} 个真正可建连的物理节点中，精选出 Top {len(top_nodes)} 个唯一优选节点。")
+    print(f"\n[+] 测试完毕！最终精选出 {len(top_nodes)} 个最优质可用节点。")
 
-    # 输出 Base64 订阅文件
+    # 导出 Base64 订阅文件
     sub_content = "\n".join(top_nodes)
     encoded_sub = base64.b64encode(sub_content.encode('utf-8')).decode('utf-8')
 
@@ -391,7 +413,7 @@ def main():
     with open("public/nekoray_sub.txt", "w", encoding="utf-8") as f:
         f.write(encoded_sub)
 
-    print("[+] 订阅文件 nekoray_sub.txt 及 public/nekoray_sub.txt 更新成功！")
+    print("[+] 订阅文本 `nekoray_sub.txt` 及 `public/nekoray_sub.txt` 已成功写入并更新！")
 
 if __name__ == "__main__":
     main()
