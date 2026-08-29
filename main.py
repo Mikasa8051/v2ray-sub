@@ -37,7 +37,6 @@ BLOCKED_SNIS = [
 
 INVALID_HOSTS = ["127.0.0.1", "0.0.0.0", "localhost"]
 
-# GFW 常见 DNS 污染投放的伪造/保留 IP 数据库
 GFW_POLLUTED_IPS = {
     "0.0.0.0", "127.0.0.1", "10.10.10.10", "1.1.1.1", "8.8.8.8",
     "59.24.3.173", "203.98.7.65", "243.185.187.39", "78.16.49.15",
@@ -50,9 +49,9 @@ HEADERS = {
     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
 }
 
-MAX_WORKERS = 30           # 线程数
-TOP_NODE_LIMIT = 150        # 精选输出前 150 个最高质量节点
-TLS_HANDSHAKE_TIMEOUT = 1.5 # TLS 握手超时限制（秒）
+MAX_WORKERS = 40           # 适当加大并发
+TOP_NODE_LIMIT = 100        # 精选 Top 100 优质节点
+TLS_HANDSHAKE_TIMEOUT = 0.8 # 严格控制握手超时为 0.8 秒以内
 
 # ==================== 工具函数 ====================
 
@@ -175,7 +174,7 @@ def is_blacklisted(node_str: str) -> bool:
     return False
 
 def extract_node_details(node_str: str):
-    """深度提取节点信息，包含 SNI / TLS 状态"""
+    """提取节点的地址、端口、TLS 状态及 SNI"""
     try:
         is_tls = False
         sni = None
@@ -214,12 +213,12 @@ def extract_node_details(node_str: str):
     except Exception:
         return None, None, False, None
 
-# ==================== 核心：TLS 握手探针与响应测试 ====================
+# ==================== 防污染 DNS 与 TLS 握手 ====================
 
 def query_doh_provider(doh_url: str, host: str) -> str:
     try:
         req = urllib.request.Request(f"{doh_url}?name={host}&type=1", headers=HEADERS)
-        with urllib.request.urlopen(req, timeout=2.0) as resp:
+        with urllib.request.urlopen(req, timeout=1.5) as resp:
             data = json.loads(resp.read().decode())
             if data.get("Status") == 0 and "Answer" in data:
                 for ans in data["Answer"]:
@@ -239,10 +238,6 @@ def check_china_doh_multi(host: str) -> str:
     return query_doh_provider("https://doh.pub/resolve", host)
 
 def check_tls_and_latency(ip: str, port: int, is_tls: bool, sni: str):
-    """
-    针对 TLS 进行握手探针测试，测量真实响应 RTT。
-    如果 TLS 握手失败或耗时超过阈值，说明节点严重卡顿或配置失效，返回 -1。
-    """
     start_time = time.time()
     try:
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -265,22 +260,21 @@ def check_tls_and_latency(ip: str, port: int, is_tls: bool, sni: str):
         return -1
 
 def validate_and_score_node(node_str: str):
-    """综合评估：域名解析 -> 防 DNS 污染 -> TLS/TCP 握手探针 -> 延迟打分"""
     host, port, is_tls, sni = extract_node_details(node_str)
     if not host or not port:
         return None
 
-    # 1. 国内双 DoH 解析防污染
     resolved_ip = check_china_doh_multi(host)
     if not resolved_ip or resolved_ip in GFW_POLLUTED_IPS:
         return None
 
-    # 2. 执行 TLS / TCP 响应探针测试
     rtt = check_tls_and_latency(resolved_ip, port, is_tls, sni)
     if rtt <= 0:
-        return None  # 握手失败或响应超时（>1.5s）的弱节点
+        return None
 
-    return (node_str, rtt)
+    # 返回底层真实 IP:Port 标识，便于物理去重
+    ip_port_key = f"{resolved_ip}:{port}"
+    return (node_str, rtt, ip_port_key)
 
 # ==================== 主逻辑 ====================
 
@@ -295,29 +289,37 @@ def main():
     all_raw_nodes.extend(scrape_telegram_channels())
 
     valid_format_nodes = [n.strip() for n in all_raw_nodes if re.match(PROTOCOL_PATTERN, n.strip()) and not is_blacklisted(n.strip())]
+    
+    # 初步字符级去重
     unique_nodes = list(set(valid_format_nodes))
     total_count = len(unique_nodes)
-    print(f"[+] 汇聚去重后共有 {total_count} 个待检测节点")
+    print(f"[+] 汇聚初步去重后共有 {total_count} 个待检测节点")
 
-    print(f"[+] 启动 DoH 防污染 + TLS 协议握手探针过滤 (线程数: {MAX_WORKERS})...")
-    scored_nodes = []
+    print(f"[+] 启动 DoH 真实 IP 防污染 + 物理套壳去重 + TLS 握手测试 (线程数: {MAX_WORKERS})...")
     
+    scored_nodes = []
+    seen_ip_ports = set()  # 核心：用于物理 IP:Port 级硬去重 Set
+
     with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
         future_to_node = {executor.submit(validate_and_score_node, node): node for node in unique_nodes}
         completed = 0
         for future in concurrent.futures.as_completed(future_to_node):
             res = future.result()
             if res:
-                scored_nodes.append(res)
+                node_str, rtt, ip_port_key = res
+                # 核心硬去重：如果这个 IP:Port 已经存在，不管它换了什么套壳域名，一律丢弃！
+                if ip_port_key not in seen_ip_ports:
+                    seen_ip_ports.add(ip_port_key)
+                    scored_nodes.append((node_str, rtt))
             completed += 1
             if completed % 100 == 0 or completed == total_count:
-                print(f"[*] 进度: {completed}/{total_count} | 墙内响应良好节点: {len(scored_nodes)}")
+                print(f"[*] 进度: {completed}/{total_count} | 物理独立可用节点: {len(scored_nodes)}")
 
-    # 按照握手响应耗时排序 (RTT 从小到大，优先保存响应最灵敏的节点)
+    # 按 TLS / TCP 响应耗时升序排列
     scored_nodes.sort(key=lambda x: x[1])
     top_nodes = [item[0] for item in scored_nodes[:TOP_NODE_LIMIT]]
 
-    print(f"\n[+] 筛选完成！已从 {len(scored_nodes)} 个合格节点中精选出响应最快的 Top {len(top_nodes)} 个节点。")
+    print(f"\n[+] 筛选完成！从 {len(scored_nodes)} 个物理独立节点中，精选出响应最快的 Top {len(top_nodes)} 个唯一节点。")
 
     # 输出 base64 订阅文件
     sub_content = "\n".join(top_nodes)
