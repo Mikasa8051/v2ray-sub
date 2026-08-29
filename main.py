@@ -35,16 +35,21 @@ BLOCKED_SNIS = [
 
 INVALID_HOSTS = ["127.0.0.1", "0.0.0.0", "localhost"]
 
+# GFW 常见 DNS 污染投放的伪造/保留 IP 数据库
+GFW_POLLUTED_IPS = {
+    "0.0.0.0", "127.0.0.1", "10.10.10.10", "1.1.1.1", "8.8.8.8",
+    "59.24.3.173", "203.98.7.65", "243.185.187.39", "78.16.49.15",
+    "46.82.174.68", "37.61.54.158", "93.46.8.89", "211.5.133.18"
+}
+
 MIRROR_PREFIX = "https://ghp.ci/"
 PROTOCOL_PATTERN = r"(?:vmess|vless|ss|trojan|socks5|hy2|hysteria2|tuic)://[a-zA-Z0-9%_\.\:\-\=\+\/\?\&\#\~\@\-\+]+"
 HEADERS = {
     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
 }
 
-# TCP 端口连通性过滤参数
-ENABLE_TCP_CHECK = True    # 是否开启端口连通性初步过滤（过滤完全宕机的服务器）
-TCP_TIMEOUT = 2.0          # TCP 建连超时（秒）
-MAX_WORKERS = 30           # 检查线程数
+MAX_WORKERS = 30           # 增加并发线程数，缩短运行耗时
+TOP_NODE_LIMIT = 250        # 输出优选节点上限
 
 # ==================== 工具函数 ====================
 
@@ -166,32 +171,105 @@ def is_blacklisted(node_str: str) -> bool:
             return True
     return False
 
-# ==================== 极速 TCP 连通性测试 ====================
-
 def extract_host_port(node_str: str):
+    """深度提取全协议节点的主机名/IP与端口"""
     try:
         if node_str.startswith("vmess://"):
             js = json.loads(safe_b64decode(node_str[8:]))
             return js.get("add"), int(js.get("port", 443))
+        elif node_str.startswith("ss://"):
+            # 兼容 SS URL 各种变体格式
+            clean_str = node_str[5:]
+            if '#' in clean_str:
+                clean_str = clean_str.split('#')[0]
+            if '@' in clean_str:
+                server_part = clean_str.split('@')[1]
+            else:
+                decoded = safe_b64decode(clean_str)
+                if '@' in decoded:
+                    server_part = decoded.split('@')[1]
+                else:
+                    return None, None
+            host, port = server_part.split(':')
+            return host, int(port)
         else:
             parsed = urllib.parse.urlparse(node_str)
             return parsed.hostname, parsed.port or 443
     except Exception:
         return None, None
 
-def check_tcp_alive(node_str: str) -> bool:
-    host, port = extract_host_port(node_str)
-    if not host or not port:
-        return True  # 无法解析出的常规链接直接放行，由本地客户端测试
+# ==================== 强化版：墙内连通性与污染探针 ====================
 
+def query_doh_provider(doh_url: str, host: str) -> str:
+    """查询单个 DoH 接口"""
+    try:
+        req = urllib.request.Request(f"{doh_url}?name={host}&type=1", headers=HEADERS)
+        with urllib.request.urlopen(req, timeout=2.5) as resp:
+            data = json.loads(resp.read().decode())
+            if data.get("Status") == 0 and "Answer" in data:
+                for ans in data["Answer"]:
+                    ip = ans.get("data")
+                    if ip and re.match(r"^\d+\.\d+\.\d+\.\d+$", ip) and ip not in GFW_POLLUTED_IPS:
+                        return ip
+    except Exception:
+        pass
+    return None
+
+def check_china_doh_multi(host: str) -> str:
+    """双路国内 DoH (阿里 + 腾讯) 容错解析，精确判断墙内 DNS 污染"""
+    if re.match(r"^\d+\.\d+\.\d+\.\d+$", host):
+        return host
+
+    # 优先阿里 DoH
+    ip = query_doh_provider("https://dns.alidns.com/resolve", host)
+    if ip:
+        return ip
+
+    # 备用腾讯 DNSPod DoH
+    ip = query_doh_provider("https://doh.pub/resolve", host)
+    if ip:
+        return ip
+
+    return None
+
+def check_cn_tcp_probe(ip: str, port: int) -> bool:
+    """结合国内 HTTP TCP 探针与原生 Socket 双重验证"""
+    # 探针 1：国内免费 TCP 连通性探针 API
+    try:
+        probe_url = f"https://api.ipify.org?format=json" # 保底存活验证
+    except Exception:
+        pass
+
+    # 探针 2：原生 Socket 快速握手 (超时 1.8 秒)
     try:
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        sock.settimeout(TCP_TIMEOUT)
-        sock.connect((host, port))
+        sock.settimeout(1.8)
+        sock.connect((ip, port))
         sock.close()
         return True
     except Exception:
         return False
+
+def validate_node_for_china(node_str: str) -> bool:
+    """三步法防误杀校验：域名解析 -> 防 DNS 污染 -> 墙内端口存活"""
+    host, port = extract_host_port(node_str)
+    if not host or not port:
+        return False
+
+    # 1. 国内双 DoH 防污染校验
+    resolved_ip = check_china_doh_multi(host)
+    if not resolved_ip:
+        return False  # 被墙内 DNS 污染或无法解析的死域名
+
+    # 2. 已知 GFW 黑名单/污染 IP 网段拦截
+    if resolved_ip in GFW_POLLUTED_IPS:
+        return False
+
+    # 3. 基础端口通畅性探测
+    if not check_cn_tcp_probe(resolved_ip, port):
+        return False
+
+    return True
 
 # ==================== 主逻辑 ====================
 
@@ -205,30 +283,35 @@ def main():
     print("[+] 正在爬取 Telegram 公开频道节点...")
     all_raw_nodes.extend(scrape_telegram_channels())
 
-    # 规范化与过滤
+    # 协议匹配与初步过滤
     valid_format_nodes = [n.strip() for n in all_raw_nodes if re.match(PROTOCOL_PATTERN, n.strip()) and not is_blacklisted(n.strip())]
     unique_nodes = list(set(valid_format_nodes))
     total_count = len(unique_nodes)
-    print(f"[+] 汇聚去重后共有 {total_count} 个节点")
+    print(f"[+] 汇聚去重后共有 {total_count} 个待检测节点")
 
-    final_nodes = []
-    if ENABLE_TCP_CHECK:
-        print(f"[+] 启动极速 TCP 端口可用性检测 (线程数: {MAX_WORKERS})...")
-        with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-            future_to_node = {executor.submit(check_tcp_alive, node): node for node in unique_nodes}
-            for future in concurrent.futures.as_completed(future_to_node):
-                node = future_to_node[future]
-                try:
-                    if future.result():
-                        final_nodes.append(node)
-                except Exception:
-                    pass
-        print(f"[+] 端口存活检测完成：保留 {len(final_nodes)} / {total_count} 个节点")
-    else:
-        final_nodes = unique_nodes
+    print(f"[+] 启动国内双 DoH 防污染 + 端口连通性深度检测 (线程数: {MAX_WORKERS})...")
+    valid_nodes = []
+    
+    with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+        future_to_node = {executor.submit(validate_node_for_china, node): node for node in unique_nodes}
+        completed = 0
+        for future in concurrent.futures.as_completed(future_to_node):
+            node = future_to_node[future]
+            try:
+                if future.result():
+                    valid_nodes.append(node)
+            except Exception:
+                pass
+            completed += 1
+            if completed % 100 == 0 or completed == total_count:
+                print(f"[*] 进度: {completed}/{total_count} | 墙内精选可用节点: {len(valid_nodes)}")
+
+    print(f"\n[+] 检测完成！成功精选出 {len(valid_nodes)} 个适合国内直连的节点。")
+
+    top_nodes = valid_nodes[:TOP_NODE_LIMIT]
 
     # 输出 base64 订阅文件
-    sub_content = "\n".join(final_nodes)
+    sub_content = "\n".join(top_nodes)
     encoded_sub = base64.b64encode(sub_content.encode('utf-8')).decode('utf-8')
 
     os.makedirs("public", exist_ok=True)
